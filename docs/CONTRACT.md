@@ -68,7 +68,8 @@ bom.login_attempts (id bigserial pk, ip text not null, at timestamptz default no
   (`x-worker-paused: 1`) or a usage limit is active (`x-worker-limit-until`); releases stale claims (processing for > 10 min
   → pending, or → error "timed out" after 3 attempts); then — under a transaction advisory lock and only when NO page is
   `processing` — claims the next page: oldest job first, then page order, `pending` or `waiting_limit` whose `retry_at` has
-  passed (attempts + 1). One page at a time, system-wide.
+  passed (attempts + 1). Drawings one after another; up to 4 sheets of the active drawing (the one being read,
+  else the oldest queued) are read in parallel.
   `POST /api/worker/result`: ok → validate `result` with `PageZod` (invalid → retryable error), store `duration_ms`.
   `kind: "usage_limit"` → `waiting_limit` until `retryAt` (clamped to 1 min … 8 days, default 30 min), attempt not counted,
   queue held until then. `kind: "auth"` → back to `pending`, attempt not counted (worker logged out).

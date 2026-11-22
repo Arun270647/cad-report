@@ -106,8 +106,9 @@ export function loadConfig(env = process.env, envFile = path.join(HERE, ".env"))
     claudeModel: String(get("CLAUDE_MODEL") || "").trim(),
     pollIntervalMs: intEnv(get("POLL_INTERVAL_MS"), 5000, 500, 600000),
     taskTimeoutMs: intEnv(get("TASK_TIMEOUT_MS"), 480000, 1000, 3600000),
-    // One page at a time (the server also enforces this) so parallel uploads never stack up against plan limits.
-    concurrency: 1,
+    // Sheets of the active drawing read in parallel (1–4, default 4). The server hands out at most 4 sheets of ONE
+    // drawing at a time, so drawings still queue one after another.
+    concurrency: intEnv(get("CONCURRENCY"), 4, 1, 4),
     // Per-task scratch dirs live here (default <worker dir>/tmp, NOT the system temp dir, which may be on a full C:).
     workDir: path.resolve(String(get("WORK_DIR") || "").trim() || path.join(HERE, "tmp")),
   };
@@ -528,6 +529,16 @@ function short(t) { return `job ${String(t.jobId).slice(0, 8)} page ${t.page}`; 
 /** The catalog for `version`, from the in-memory cache or GET /api/worker/catalog. Throws on failure / mismatch. */
 async function ensureCatalog(cfg, info, state, version) {
   if (state.catalog?.version === version) return state.catalog;
+  // Parallel slots share one in-flight download per version.
+  if (state.catalogLoading?.version === version) return state.catalogLoading.promise;
+  const promise = fetchCatalog(cfg, info, state, version).finally(() => {
+    if (state.catalogLoading?.promise === promise) state.catalogLoading = null;
+  });
+  state.catalogLoading = { version, promise };
+  return promise;
+}
+
+async function fetchCatalog(cfg, info, state, version) {
   const res = await fetch(`${cfg.workerUrl}/api/worker/catalog`, { headers: headers(cfg, info), signal: AbortSignal.timeout(30000), redirect: "error" });
   if (res.status === 204) { await res.body?.cancel(); throw new Error("server has no price list loaded"); }
   if (!res.ok) throw new Error(`GET /api/worker/catalog → ${res.status}`);
@@ -769,7 +780,7 @@ async function heartbeatLoop(cfg, prep, state) {
 
 async function runForever(cfg) {
   const prep = await prepare(cfg);
-  log(`worker started: ${prep.info}; node ${process.version}; server ${cfg.workerUrl}; one page at a time; claude = ${prep.claude.display}${cfg.claudeModel ? `; model ${cfg.claudeModel}` : ""}`);
+  log(`worker started: ${prep.info}; node ${process.version}; server ${cfg.workerUrl}; ${cfg.concurrency} sheet(s) in parallel, one drawing at a time; claude = ${prep.claude.display}${cfg.claudeModel ? `; model ${cfg.claudeModel}` : ""}`);
   const state = { stopping: false, hardStop: false, wakers: new Set(), current: 0, startedAt: new Date().toISOString() };
   const wakeAll = () => { for (const w of [...state.wakers]) w(); };
   const onSignal = (sig) => {

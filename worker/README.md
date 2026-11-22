@@ -167,11 +167,13 @@ Make sure `claude` is on the service's PATH (or set `CLAUDE_BIN=/full/path/to/cl
 | `CLAUDE_MODEL` | Claude Code default | Passed as `--model` |
 | `POLL_INTERVAL_MS` | 5000 | Idle poll interval |
 | `TASK_TIMEOUT_MS` | 480000 | Per-page timeout |
+| `CONCURRENCY` | 4 | Sheets of the active drawing read in parallel (1–4) |
 | `WORK_DIR` | `<worker folder>/tmp` | Per-page scratch folders |
 | `LOG_KEEP_DAYS` | 14 | Supervisor: days of `logs\worker-YYYY-MM-DD.log` to keep |
 
-Pages are always processed **one at a time** (the old `CONCURRENCY` setting is ignored); the server enforces the
-same, so parallel uploads queue up instead of hitting plan limits together.
+Drawings are processed **one after another**; within the active drawing up to **4 sheets are read in parallel**
+(`CONCURRENCY`, 1–4, default 4; the server enforces the same cap). Total plan usage is unchanged — sheets just
+finish sooner (a 25-sheet drawing: about 2.5–3 min instead of 8.5).
 
 ## Behaviour
 

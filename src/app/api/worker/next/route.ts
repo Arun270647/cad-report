@@ -10,8 +10,10 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
 
-/** Advisory-lock key that serialises claims: only ONE page is ever being read at a time. */
+/** Advisory-lock key that serialises claims. */
 const CLAIM_LOCK = 4_812_017;
+/** Sheets of the ACTIVE drawing read at the same time. Drawings themselves are still processed one after another. */
+const MAX_PARALLEL_PAGES = 4;
 
 function workerInfo(req: Request): string | null {
   const v = req.headers.get("x-worker-info");
@@ -31,8 +33,8 @@ function idle(reason?: { paused?: boolean; limitUntil?: Date | null }): NextResp
 /**
  * GET (Bearer WORKER_TOKEN) → 200 WorkerTask, or 204 when idle / paused / waiting for a usage-limit reset.
  * GET ?probe=1 → 200 {ok:true} after updating the heartbeat (no claim, no stale release).
- * Queue: strictly one page at a time, oldest job first, then page order. Pages waiting for a usage-limit
- * reset become claimable again at retry_at.
+ * Queue: drawings one after another (oldest first); within the active drawing up to MAX_PARALLEL_PAGES sheets are
+ * read at the same time, in page order. Pages waiting for a usage-limit reset become claimable again at retry_at.
  */
 export const GET = handle(async (req: Request) => {
   requireWorker(req);
@@ -65,18 +67,27 @@ export const GET = handle(async (req: Request) => {
     RETURNING job_id`;
   for (const jobId of new Set(released.map((r) => r.job_id))) await refreshJobStatus(db, jobId);
 
-  // Atomically claim the next page — only if nothing else is being read right now.
+  // Atomically claim the next page: up to MAX_PARALLEL_PAGES sheets of ONE drawing at a time. The active drawing is
+  // the one already being read (oldest first); only when none is being read does the oldest queued drawing start.
   const task = await db.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(${CLAIM_LOCK})`;
-    const [busy] = await tx<{ n: number }[]>`SELECT count(*)::int AS n FROM bom.job_pages WHERE status = 'processing'`;
-    if ((busy?.n ?? 0) > 0) return null;
+    const busy = await tx<{ job_id: string; n: number }[]>`
+      SELECT p.job_id, count(*)::int AS n
+        FROM bom.job_pages p JOIN bom.jobs j ON j.id = p.job_id
+       WHERE p.status = 'processing'
+       GROUP BY p.job_id, j.created_at
+       ORDER BY j.created_at`;
+    const inFlight = busy.reduce((s, b) => s + b.n, 0);
+    if (inFlight >= MAX_PARALLEL_PAGES) return null;
+    const activeJob = busy[0]?.job_id ?? null; // null → any job may start (oldest first)
     const [row] = await tx<{ job_id: string; page: number; attempts: number; media_type: string | null; image: Buffer | null }[]>`
       UPDATE bom.job_pages
          SET status = 'processing', attempts = attempts + 1, claimed_at = now(), retry_at = NULL, updated_at = now()
        WHERE (job_id, page) = (
                SELECT p.job_id, p.page
                  FROM bom.job_pages p JOIN bom.jobs j ON j.id = p.job_id
-                WHERE p.status = 'pending' OR (p.status = 'waiting_limit' AND p.retry_at <= now())
+                WHERE (p.status = 'pending' OR (p.status = 'waiting_limit' AND p.retry_at <= now()))
+                  AND (${activeJob}::uuid IS NULL OR p.job_id = ${activeJob}::uuid)
                 ORDER BY j.created_at, p.page
                 LIMIT 1
                 FOR UPDATE OF p SKIP LOCKED)

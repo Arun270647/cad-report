@@ -257,7 +257,7 @@ export default function AdminWorkerPage() {
                 </CardHeader>
                 <CardContent className="space-y-1 text-sm">
                   <p className="text-3xl font-semibold" data-testid="queue-length">{view.queue.pending + view.queue.processing + view.queue.waitingLimit}</p>
-                  <p className="text-muted-foreground">pages waiting or being read (one at a time)</p>
+                  <p className="text-muted-foreground">pages waiting or being read (up to 4 sheets of one drawing at a time)</p>
                   <p>Being read: {view.queue.processing}</p>
                   <p>Queued: {view.queue.pending}</p>
                   <p>Waiting – usage limit: {view.queue.waitingLimit}</p>
