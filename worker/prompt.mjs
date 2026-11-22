@@ -89,6 +89,7 @@ Return strict JSON matching the schema. Rules:
 - motor_flc_a / motor_kw: only for the protective device (MPCB/overload/MCCB) feeding a motor whose FLC (A) or kW is printed on this sheet; else null.
 - terminal_blocks: for terminal strips (e.g. "X1", "-XD1"), list the terminal numbers drawn on this sheet in "terminals" and set count = number of terminals; terminal_type e.g. "FEED-THROUGH", "EARTH", "FUSE", "DISCONNECT"; rating e.g. "2.5sqmm", "4sqmm". Do not also list terminals as components.
 - notes: anything ambiguous or illegible that an estimator should check.
+- Do NOT list field equipment that is not supplied inside the panel (motors, pumps, field sensors, valves, actuators, external junction boxes); for motors only record their FLC/kW on the protective device that feeds them.
 Never invent devices. If unreadable, return what you can and explain in notes.`;
 
 /** The fixed user-message text that accompanies the page image (page is a validated integer). */
