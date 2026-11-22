@@ -12,7 +12,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -74,6 +74,8 @@ export function loadConfig(env = process.env, envFile = path.join(HERE, ".env"))
     pollIntervalMs: intEnv(get("POLL_INTERVAL_MS"), 5000, 500, 600000),
     taskTimeoutMs: intEnv(get("TASK_TIMEOUT_MS"), 480000, 1000, 3600000),
     concurrency: intEnv(get("CONCURRENCY"), 1, 1, 3),
+    // Per-task scratch dirs live here (default <worker dir>/tmp, NOT the system temp dir, which may be on a full C:).
+    workDir: path.resolve(String(get("WORK_DIR") || "").trim() || path.join(HERE, "tmp")),
   };
 }
 
@@ -92,7 +94,6 @@ function validateConfig(cfg) {
     }
   }
   if (!cfg.token) problems.push("WORKER_TOKEN is empty — paste it into worker/.env");
-  if (cfg.model && !/^[A-Za-z0-9._\-[\]]+$/.test(cfg.model)) problems.push("CLAUDE_MODEL contains unexpected characters");
   if (cfg.claudeModel && !/^[A-Za-z0-9._\-[\]]+$/.test(cfg.claudeModel)) problems.push("CLAUDE_MODEL contains unexpected characters");
   return problems;
 }
@@ -190,6 +191,7 @@ export function resolveClaude(claudeBin) {
   if (!IS_WIN) return { command: "claude", prefixArgs: [], display: "claude" };
   const home = process.env.USERPROFILE || os.homedir();
   const extra = [path.join(home, ".local", "bin")];
+  if (process.env.APPDATA) extra.push(path.join(process.env.APPDATA, "npm"));
   const exe = findOnPath(["claude.exe"], extra);
   if (exe) return { command: exe, prefixArgs: [], display: exe };
   const shim = findOnPath(["claude.cmd"], extra);
@@ -233,12 +235,14 @@ function killTree(child) {
  * onLine(line) is called for each stdout line (stdout is not buffered as a whole).
  */
 function runChild(claude, args, { stdin, cwd, timeoutMs, onLine, maxStdout = 64 * 1024 * 1024 }) {
+  // Point the child's temp dir at its own scratch cwd too (keeps writes off a small system drive).
+  const env = { ...sanitizedEnv(), TMP: cwd, TEMP: cwd, TMPDIR: cwd };
   return new Promise((resolve) => {
     let child;
     try {
       child = spawn(claude.command, [...claude.prefixArgs, ...args], {
         cwd,
-        env: sanitizedEnv(),
+        env,
         shell: false,
         windowsHide: true,
         detached: !IS_WIN,
@@ -390,7 +394,8 @@ export async function extractPage(task, cfg, claude) {
   const started = Date.now();
   let cwd;
   try {
-    cwd = await mkdtemp(path.join(os.tmpdir(), "bom-worker-"));
+    await mkdir(cfg.workDir, { recursive: true });
+    cwd = await mkdtemp(path.join(cfg.workDir, "task-"));
     let init = null;
     let result = null;
     const r = await runChild(claude, buildClaudeArgs(cfg.claudeModel), {
@@ -480,16 +485,16 @@ function sleep(ms, state) {
   });
 }
 
-async function claudeVersion(claude) {
-  const r = await runChild(claude, ["--version"], { cwd: os.tmpdir(), timeoutMs: 30000 });
+async function claudeVersion(claude, cwd) {
+  const r = await runChild(claude, ["--version"], { cwd, timeoutMs: 30000 });
   if (r.spawnError) throw new Error(`could not run Claude Code (${claude.display}): ${r.spawnError.message}`);
   const m = /\d+\.\d+\.\d+/.exec(r.stdout || "");
   return m ? m[0] : "unknown";
 }
 
 /** Verify the flags we rely on exist. Returns the missing ones. */
-async function missingFlags(claude) {
-  const r = await runChild(claude, ["--help"], { cwd: os.tmpdir(), timeoutMs: 30000 });
+async function missingFlags(claude, cwd) {
+  const r = await runChild(claude, ["--help"], { cwd, timeoutMs: 30000 });
   if (r.spawnError) throw new Error(`could not run Claude Code (${claude.display}): ${r.spawnError.message}`);
   const help = `${r.stdout}\n${r.stderr}`;
   const missing = REQUIRED_FLAGS.filter((f) => !new RegExp(`(^|[\\s,])${f.replace(/-/g, "\\-")}([\\s,=<\\[]|$)`, "m").test(help));
@@ -503,11 +508,16 @@ export async function prepare(cfg) {
   if (problems.length) throw new Error(problems.join("\n"));
   SECRET_TOKEN = cfg.token;
   const claude = resolveClaude(cfg.claudeBin);
-  const missing = await missingFlags(claude);
+  await mkdir(cfg.workDir, { recursive: true });
+  // Leftovers from a crash / hard kill (one worker per WORK_DIR).
+  for (const name of await readdir(cfg.workDir).catch(() => [])) {
+    if (/^(task|check)-/.test(name)) await rm(path.join(cfg.workDir, name), { recursive: true, force: true }).catch(() => {});
+  }
+  const missing = await missingFlags(claude, cfg.workDir);
   if (missing.length) {
     throw new Error(`Your Claude Code is missing required options: ${missing.join(", ")}.\nUpdate it (\`claude update\` or \`npm i -g @anthropic-ai/claude-code@latest\`) and try again.`);
   }
-  const version = await claudeVersion(claude);
+  const version = await claudeVersion(claude, cfg.workDir);
   const host = os.hostname().replace(/[^A-Za-z0-9._-]/g, "").slice(0, 60) || "pc";
   return { claude, version, info: `${host} claude ${version}` };
 }
@@ -626,7 +636,8 @@ export async function selfCheck(cfg) {
     return false;
   }
 
-  const dir = await mkdtemp(path.join(os.tmpdir(), "bom-worker-check-"));
+  await mkdir(cfg.workDir, { recursive: true });
+  const dir = await mkdtemp(path.join(cfg.workDir, "check-"));
   try {
     let result = null;
     const args = ["-p", "--tools", "", "--restricted", "--strict-mcp-config", "--no-session-persistence",
