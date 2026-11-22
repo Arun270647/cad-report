@@ -13,6 +13,10 @@ function sheetOf(p: PageRecord): string {
   return clean(p.result?.sheet_number) ?? String(p.page);
 }
 
+/**
+ * Identity of a physical part. `function` is deliberately NOT part of it: Claude fills it with free text per
+ * instance ("Motor M1 starter"), and identical parts must consolidate into one line. Functions are kept as notes.
+ */
 function groupKey(c: ExtractedComponent): string {
   return [
     normDeviceType(c.device_type),
@@ -21,13 +25,12 @@ function groupKey(c: ExtractedComponent): string {
     normQualifier(c.poles),
     normQualifier(c.contact_config),
     normQualifier(c.colour),
-    normQualifier(c.function),
     normQualifier(c.relay_type),
     normQualifier(c.manufacturer_pn),
   ].join("|");
 }
 
-function describe(c: ExtractedComponent): string {
+function describe(c: ExtractedComponent, fn: string | null = null): string {
   const parts = [prettyDeviceType(normDeviceType(c.device_type))];
   if (c.rating) parts.push(c.rating);
   if (c.poles) parts.push(c.poles);
@@ -35,8 +38,18 @@ function describe(c: ExtractedComponent): string {
   if (c.relay_type) parts.push(c.relay_type);
   if (c.coil_voltage) parts.push(`coil ${c.coil_voltage}`);
   if (c.colour) parts.push(c.colour);
-  if (c.function) parts.push(c.function);
+  if (fn) parts.push(fn);
   return parts.join(" ");
+}
+
+/** The single non-empty value shared by all entries (case/space-insensitive), else null. */
+function common(values: (string | null | undefined)[]): string | null {
+  const seen = new Map<string, string>();
+  for (const v of values) {
+    const c = clean(v);
+    if (c) seen.set(normQualifier(c), c);
+  }
+  return seen.size === 1 ? [...seen.values()][0] : null;
 }
 
 export interface AggregateResult {
@@ -113,22 +126,25 @@ export function aggregate(pages: PageRecord[]): AggregateResult {
     }
   }
 
-  // --- group into BOM lines
+  // --- group into BOM lines (identical parts consolidate; per-tag functions become a note)
   const groups = new Map<string, ComponentGroup>();
+  const members = new Map<string, { tag: string | null; fn: string | null }[]>();
+  const pushbuttonsByFunction: Record<string, number> = {};
   for (const u of units) {
     const c = u.occ.comp;
     const key = groupKey(c);
-    const tag = clean(c.tag)?.toUpperCase();
+    const tag = clean(c.tag)?.toUpperCase() ?? null;
+    const dt = normDeviceType(c.device_type);
     const g = groups.get(key) ?? {
       key,
-      deviceType: normDeviceType(c.device_type),
+      deviceType: dt,
       rating: clean(c.rating) ?? "",
       ratingNorm: normRating(c.rating),
       coilVoltage: clean(c.coil_voltage),
       poles: clean(c.poles),
       contactConfig: clean(c.contact_config),
       colour: clean(c.colour),
-      fn: clean(c.function),
+      fn: null,
       relayType: clean(c.relay_type),
       make: clean(c.make),
       mpn: clean(c.manufacturer_pn),
@@ -147,15 +163,51 @@ export function aggregate(pages: PageRecord[]): AggregateResult {
       g.notes.push(anomalies.find((a) => a.tags.includes(tag))?.message ?? `Anomaly on ${tag}`);
     }
     groups.set(key, g);
+    members.set(key, [...(members.get(key) ?? []), { tag, fn: clean(c.function) }]);
+    // Counted per device (not per line) so merged lines keep correct START/STOP/... counts.
+    if (dt === "PUSHBUTTON" || dt === "EMERGENCY_STOP") {
+      const f = (clean(c.function) ?? (dt === "EMERGENCY_STOP" ? "EMERGENCY STOP" : "UNSPECIFIED")).toUpperCase();
+      pushbuttonsByFunction[f] = (pushbuttonsByFunction[f] ?? 0) + u.qty;
+    }
+  }
+  for (const [key, list] of members) {
+    const g = groups.get(key)!;
+    const fns = list.map((m) => m.fn);
+    // A function shared by every unit (e.g. all "START") still describes the part and helps price matching.
+    g.fn = fns.every((f) => f) ? common(fns) : null;
+    if (g.fn) g.descriptionHint = `${g.descriptionHint} ${g.fn}`;
+    else if (fns.some((f) => f)) {
+      g.notes.push(`Function: ${list.filter((m) => m.fn).map((m) => (m.tag ? `${m.tag} ${m.fn}` : m.fn)).join("; ")}`);
+    }
   }
 
-  // --- terminal blocks: count terminals per block, detect numbering clashes
-  const terminalsPerBlock: Record<string, number> = {};
-  const blockTerminals = new Map<string, Map<string, string[]>>();
+  // --- terminal blocks: resolve type/rating per strip tag across ALL pages (a sheet may show only "X1: 1 2 3 4"
+  //     while another sheet gives X1's type and rating), then count terminals and detect numbering clashes.
+  const blockDetails = new Map<string, { types: (string | null)[]; ratings: (string | null)[] }>();
   for (const p of pages) {
     if (p.status !== "done" || !p.result || p.result.sheet_status !== "content") continue;
     for (const tb of p.result.terminal_blocks ?? []) {
       const blockTag = (clean(tb.tag) ?? "X?").toUpperCase();
+      const d = blockDetails.get(blockTag) ?? { types: [], ratings: [] };
+      d.types.push(clean(tb.terminal_type));
+      d.ratings.push(clean(tb.rating));
+      blockDetails.set(blockTag, d);
+    }
+  }
+  const terminalsPerBlock: Record<string, number> = {};
+  const blockTerminals = new Map<string, Map<string, string[]>>();
+  for (const p of pages) {
+    if (p.status !== "done" || !p.result || p.result.sheet_status !== "content") continue;
+    for (const raw of p.result.terminal_blocks ?? []) {
+      const blockTag = (clean(raw.tag) ?? "X?").toUpperCase();
+      const d = blockDetails.get(blockTag)!;
+      // Missing on this sheet → inherit the strip's value when every other sheet agrees; never guess otherwise.
+      const ambiguous: string[] = [];
+      const terminal_type = clean(raw.terminal_type) ?? common(d.types);
+      const rating = clean(raw.rating) ?? common(d.ratings);
+      if (!terminal_type && d.types.some(Boolean)) ambiguous.push("type");
+      if (!rating && d.ratings.some(Boolean)) ambiguous.push("rating");
+      const tb = { ...raw, terminal_type, rating };
       const n = tb.terminals?.length ? tb.terminals.length : Math.max(0, Math.round(tb.count || 0));
       terminalsPerBlock[blockTag] = (terminalsPerBlock[blockTag] ?? 0) + n;
       const seen = blockTerminals.get(blockTag) ?? new Map<string, string[]>();
@@ -188,6 +240,9 @@ export function aggregate(pages: PageRecord[]): AggregateResult {
       g.qty += n;
       if (!g.tags.includes(blockTag)) g.tags.push(blockTag);
       if (!g.sheets.includes(sheetOf(p))) g.sheets.push(sheetOf(p));
+      if (ambiguous.length) {
+        g.notes.push(`${blockTag} on sheet ${sheetOf(p)}: terminal ${ambiguous.join(" and ")} not shown and differs on other sheets — check`);
+      }
       groups.set(key, g);
     }
   }
@@ -213,7 +268,7 @@ export function aggregate(pages: PageRecord[]): AggregateResult {
   const counts: DeviceCounts = {
     totalDevices: 0,
     pilotLampsByColour: {},
-    pushbuttonsByFunction: {},
+    pushbuttonsByFunction,
     relaysByType: {},
     terminalsPerBlock,
     byDeviceType: {},
@@ -223,8 +278,6 @@ export function aggregate(pages: PageRecord[]): AggregateResult {
     counts.totalDevices += g.qty;
     inc(counts.byDeviceType, g.deviceType, g.qty);
     if (g.deviceType === "PILOT_LAMP") inc(counts.pilotLampsByColour, (g.colour ?? "UNSPECIFIED").toUpperCase(), g.qty);
-    if (g.deviceType === "PUSHBUTTON" || g.deviceType === "EMERGENCY_STOP")
-      inc(counts.pushbuttonsByFunction, (g.fn ?? (g.deviceType === "EMERGENCY_STOP" ? "EMERGENCY STOP" : "UNSPECIFIED")).toUpperCase(), g.qty);
     if (g.deviceType === "CONTROL_RELAY" || g.deviceType === "TIMER_RELAY") {
       const t = [g.contactConfig ?? g.relayType ?? "", g.coilVoltage ?? ""].filter(Boolean).join(" ").toUpperCase() || "UNSPECIFIED";
       inc(counts.relaysByType, t, g.qty);

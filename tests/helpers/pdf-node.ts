@@ -23,7 +23,8 @@ async function getPdfJs(): Promise<PdfJs> {
 
 function pdfjsAssetDir(sub: string): string {
   const pkg = path.dirname(require_.resolve("pdfjs-dist/package.json"));
-  return path.join(pkg, sub) + path.sep;
+  // pdfjs requires a trailing "/" (not "\") even on Windows.
+  return path.join(pkg, sub).replace(/\\/g, "/") + "/";
 }
 
 async function openDoc(buf: Buffer) {
