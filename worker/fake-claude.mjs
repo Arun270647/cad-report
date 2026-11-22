@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Fake `claude` CLI for tests (tests/worker.test.ts). Never used in production.
-//   FAKE_CLAUDE_MODE=ok|garbage|notloggedin|slow|fenced   (default ok)
+//   FAKE_CLAUDE_MODE=ok|garbage|notloggedin|usagelimit|slow|fenced   (default ok)
 // In ok/fenced mode the page's `notes` carry diagnostics the test asserts on:
 //   env:ANTHROPIC_API_KEY=absent|present, env:WORKER_TOKEN=..., argv-has-image=true|false,
 //   flags-ok=true|false, cwd-empty=true|false, stdin-ok=true|false
@@ -33,6 +33,17 @@ Options:
 }
 
 const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+
+// `claude auth status` (heartbeat login check; makes no model call)
+if (argv[0] === "auth" && argv[1] === "status") {
+  if (mode === "notloggedin") {
+    out({ loggedIn: false, authMethod: "none" });
+    process.exit(1);
+  }
+  out({ loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty", subscriptionType: "team" });
+  process.exit(0);
+}
+
 const page = (notes) => ({
   sheet_number: "3", sheet_title: "MOTOR STARTER", sheet_status: "content",
   components: [{
@@ -92,6 +103,10 @@ process.stdin.on("end", async () => {
     case "notloggedin":
       process.stderr.write("Invalid API key · Please run /login\n");
       out({ type: "result", subtype: "success", is_error: true, result: "Not logged in · Please run /login" });
+      return process.exit(1);
+    case "usagelimit":
+      // Claude Code's plan-limit message: "...|<epoch seconds of the reset>"
+      out({ type: "result", subtype: "success", is_error: true, result: `Claude AI usage limit reached|${process.env.FAKE_CLAUDE_RESET || "1900000000"}` });
       return process.exit(1);
     case "slow":
       setTimeout(() => process.exit(0), 600000);

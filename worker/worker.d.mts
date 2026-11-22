@@ -22,3 +22,7 @@ export function runOnce(cfg: WorkerConfig, prep?: Prepared, state?: any): Promis
   status: "idle" | "processed" | "http_error" | "invalid_task"; backoffMs?: number | null; posted?: number | null; body?: any; outcome?: any; httpStatus?: number;
 }>;
 export function selfCheck(cfg: WorkerConfig): Promise<boolean>;
+export const HEARTBEAT_MS: number;
+export function parseLimitReset(text: string, now?: Date): Date | null;
+export function checkLogin(claude: Prepared["claude"], cwd: string): Promise<{ ok: boolean | null; detail: string }>;
+export function heartbeatBody(prep: Prepared, state: any): import("../src/lib/contract").WorkerHeartbeatRequest;

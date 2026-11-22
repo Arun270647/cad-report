@@ -22,9 +22,9 @@ export const GET = handle(async (req: Request, ctx: Ctx) => {
   if (!job) throw new HttpError(404, "not_found", "Job not found");
 
   const rows = await db<
-    { page: number; status: PageStatus; skip_reason: string | null; error: string | null; result: PageExtraction | null; attempts: number }[]
+    { page: number; status: PageStatus; skip_reason: string | null; error: string | null; result: PageExtraction | null; attempts: number; retry_at: Date | null }[]
   >`
-    SELECT page, status, skip_reason, error, CASE WHEN status = 'done' THEN result END AS result, attempts
+    SELECT page, status, skip_reason, error, CASE WHEN status = 'done' THEN result END AS result, attempts, retry_at
       FROM bom.job_pages WHERE job_id = ${id} ORDER BY page`;
 
   // Status is persisted at every write; derive it here with the same rule so a read is always consistent.
@@ -32,14 +32,12 @@ export const GET = handle(async (req: Request, ctx: Ctx) => {
 
   let queuePosition = 0;
   if (status !== "done") {
-    // Pending pages from other jobs that the worker will take before this job's first pending page
-    // (the worker claims ORDER BY updated_at, page).
+    // The worker reads one page at a time, oldest job first: count queued pages of older jobs.
     const [q] = await db<{ n: number }[]>`
-      SELECT count(*)::int AS n FROM bom.job_pages
-       WHERE status = 'pending' AND job_id <> ${id}
-         AND updated_at < coalesce(
-               (SELECT min(updated_at) FROM bom.job_pages WHERE job_id = ${id} AND status = 'pending'),
-               now())`;
+      SELECT count(*)::int AS n
+        FROM bom.job_pages p JOIN bom.jobs j ON j.id = p.job_id
+       WHERE p.status IN ('pending', 'processing', 'waiting_limit') AND p.job_id <> ${id}
+         AND j.created_at < ${job.created_at}`;
     queuePosition = q?.n ?? 0;
   }
 
@@ -47,8 +45,9 @@ export const GET = handle(async (req: Request, ctx: Ctx) => {
     page: r.page,
     status: r.status,
     skipReason: r.skip_reason,
-    error: r.error,
+    error: r.status === "waiting_limit" ? null : r.error,
     result: r.status === "done" ? r.result : null,
+    retryAt: r.status === "waiting_limit" && r.retry_at ? new Date(r.retry_at).toISOString() : null,
   }));
   const view: JobView = {
     id: job.id,

@@ -114,6 +114,22 @@ export function requireSession(req: Request): string {
   return email;
 }
 
+/** ADMIN_EMAILS: comma-separated subset of ALLOWED_EMAILS who may open /admin (worker status, pause/resume). */
+export function adminEmails(raw: string | undefined = process.env.ADMIN_EMAILS): string[] {
+  return allowedEmails(raw);
+}
+
+export function isAdmin(email: string, list: string[] = adminEmails()): boolean {
+  return list.length > 0 && isAllowed(email, list);
+}
+
+/** Session email of an admin, or throw 401 (not signed in) / 403 (signed in but not an admin). */
+export function requireAdmin(req: Request): string {
+  const email = requireSession(req);
+  if (!isAdmin(email)) throw new HttpError(403, "forbidden", "Admins only");
+  return email;
+}
+
 export function cookieOptions(maxAgeS = SESSION_MAX_AGE_S) {
   return {
     httpOnly: true,

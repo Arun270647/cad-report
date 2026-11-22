@@ -165,7 +165,22 @@ describe("worker against a fake server + fake claude", () => {
     const { r, body } = await runWith("notloggedin");
     expect(body).toMatchObject({ ok: false, retryable: true });
     expect(body.error).toMatch(/not logged in/i);
+    expect(body.kind).toBe("auth");
     expect(r.backoffMs).toBe(60000);
+  });
+
+  it("plan usage limit → kind usage_limit with the parsed reset time, and waits until then", async () => {
+    const reset = Math.floor(Date.now() / 1000) + 2 * 3600;
+    process.env.FAKE_CLAUDE_RESET = String(reset);
+    try {
+      const { r, body } = await runWith("usagelimit");
+      expect(body).toMatchObject({ ok: false, retryable: true, kind: "usage_limit" });
+      expect(Date.parse(body.retryAt)).toBe(reset * 1000);
+      expect(r.backoffMs).toBeGreaterThan(2 * 3600_000 - 60_000);
+      expect(r.backoffMs).toBeLessThanOrEqual(2 * 3600_000);
+    } finally {
+      delete process.env.FAKE_CLAUDE_RESET;
+    }
   });
 
   it("slow → killed at the timeout, ok:false retryable", async () => {

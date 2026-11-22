@@ -31,8 +31,41 @@ export const REQUIRED_FLAGS = [
 const STRIPPED_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "WORKER_TOKEN"];
 
 const AUTH_RE = /not logged in|please run \/login|run \/login|\/login\b|invalid api key|authentication[_ ]error|oauth token (has )?expired|unauthori[sz]ed|\b401\b/i;
-const LIMIT_RE = /usage limit|rate[_ ]limit|limit reached|\b429\b|overloaded|\b529\b/i;
+/** claude.ai plan usage limit (hours until reset) — distinct from short transient rate limits / overload. */
+const USAGE_RE = /usage limit|limit reached|hit your (usage )?limit|out of (extra )?usage|limit will reset|resets? (at|in|on)\b|\|\d{10}\b/i;
+const LIMIT_RE = /rate[_ ]limit|\b429\b|overloaded|\b529\b/i;
 const AUTH_HELP = "Claude Code is not logged in — run `claude` once and log in";
+export const HEARTBEAT_MS = 60_000;
+const LOGIN_CHECK_MS = 5 * 60_000;
+
+/**
+ * When does a Claude plan usage limit reset? Understands the forms Claude Code prints:
+ *   "Claude AI usage limit reached|1764000000"   (epoch seconds)
+ *   "5-hour limit reached ∙ resets 3pm" / "resets at 3:30 PM (Asia/Kolkata)"   (next such local time)
+ *   "resets in 2h 15m" / "resets in 45 minutes"
+ * Returns a Date, or null when no reset time is stated (the server then waits 30 min).
+ */
+export function parseLimitReset(text, now = new Date()) {
+  const s = String(text ?? "");
+  const epoch = /\|\s*(\d{10})\b/.exec(s);
+  if (epoch) return new Date(Number(epoch[1]) * 1000);
+  const rel = /resets?\s+in\s+(?:(\d+)\s*h(?:ours?|rs?)?)?\s*(?:(\d+)\s*m(?:in(?:utes?)?)?)?/i.exec(s);
+  if (rel && (rel[1] || rel[2])) return new Date(now.getTime() + ((Number(rel[1] || 0) * 60) + Number(rel[2] || 0)) * 60_000);
+  const at = /resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(s);
+  if (at) {
+    let h = Number(at[1]);
+    const m = Number(at[2] || 0);
+    const ap = (at[3] || "").toLowerCase();
+    if (ap === "pm" && h < 12) h += 12;
+    if (ap === "am" && h === 12) h = 0;
+    if (h > 23 || m > 59) return null;
+    const d = new Date(now);
+    d.setHours(h, m, 0, 0);
+    if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
+    return d;
+  }
+  return null;
+}
 
 // ───────────────────────────── config ─────────────────────────────
 
@@ -73,7 +106,8 @@ export function loadConfig(env = process.env, envFile = path.join(HERE, ".env"))
     claudeModel: String(get("CLAUDE_MODEL") || "").trim(),
     pollIntervalMs: intEnv(get("POLL_INTERVAL_MS"), 5000, 500, 600000),
     taskTimeoutMs: intEnv(get("TASK_TIMEOUT_MS"), 480000, 1000, 3600000),
-    concurrency: intEnv(get("CONCURRENCY"), 1, 1, 3),
+    // One page at a time (the server also enforces this) so parallel uploads never stack up against plan limits.
+    concurrency: 1,
     // Per-task scratch dirs live here (default <worker dir>/tmp, NOT the system temp dir, which may be on a full C:).
     workDir: path.resolve(String(get("WORK_DIR") || "").trim() || path.join(HERE, "tmp")),
   };
@@ -366,7 +400,14 @@ export function interpretOutput({ init, result, stderr, code, timedOut, tooBig, 
 
   if (!result || result.is_error || (result.subtype && result.subtype !== "success")) {
     if (AUTH_RE.test(diag)) return { ok: false, retryable: true, kind: "auth", error: `${AUTH_HELP} (${redact(diag.trim(), 200)})` };
-    if (LIMIT_RE.test(diag)) return { ok: false, retryable: true, kind: "limit", error: `Claude usage/rate limit: ${redact(diag.trim(), 200)}` };
+    if (USAGE_RE.test(diag)) {
+      const reset = parseLimitReset(diag);
+      return {
+        ok: false, retryable: true, kind: "usage_limit", retryAt: reset ? reset.toISOString() : undefined,
+        error: `Claude plan usage limit${reset ? ` (resets ${reset.toISOString()})` : ""}: ${redact(diag.trim(), 200)}`,
+      };
+    }
+    if (LIMIT_RE.test(diag)) return { ok: false, retryable: true, kind: "limit", error: `Claude rate limit / overloaded: ${redact(diag.trim(), 200)}` };
     const what = result ? `Claude Code error (${redact(result.subtype || "is_error", 40)})` : `no result from Claude Code (exit ${code})`;
     return { ok: false, retryable: true, kind: "error", error: `${what}: ${redact(diag.trim(), 300)}` };
   }
@@ -429,11 +470,20 @@ function headers(cfg, info) {
   return { authorization: `Bearer ${cfg.token}`, "x-worker-info": info, "user-agent": "panel-bom-worker" };
 }
 
-async function fetchNext(cfg, info, { probe = false } = {}) {
+async function fetchNext(cfg, info, { probe = false, state } = {}) {
   const res = await fetch(`${cfg.workerUrl}/api/worker/next${probe ? "?probe=1" : ""}`, {
     method: "GET", headers: headers(cfg, info), signal: AbortSignal.timeout(30000), redirect: "error",
   });
-  if (res.status === 204) { await res.body?.cancel(); return null; }
+  if (state) state.lastPollAt = new Date().toISOString();
+  if (res.status === 204) {
+    if (state) {
+      const paused = res.headers.get("x-worker-paused") === "1";
+      if (paused !== !!state.serverPaused) log(paused ? "conversions paused by an admin — waiting" : "conversions resumed");
+      state.serverPaused = paused;
+    }
+    await res.body?.cancel();
+    return null;
+  }
   if (res.status === 200) {
     const body = await res.json();
     // The server answers ?probe=1 with {ok:true} (auth + heartbeat only, nothing claimed).
@@ -538,13 +588,15 @@ export async function runOnce(cfg, prep, state = { wakers: new Set() }) {
   prep = prep || (await prepare(cfg));
   let got;
   try {
-    got = await fetchNext(cfg, prep.info);
+    got = await fetchNext(cfg, prep.info, { state });
   } catch (e) {
     if (e instanceof HttpError && (e.status === 401 || e.status === 403)) {
       warn(`server rejected WORKER_TOKEN (${e.status}) — check worker/.env`);
+      state.lastError = `server rejected WORKER_TOKEN (${e.status})`;
       return { status: "http_error", httpStatus: e.status, backoffMs: 60000 };
     }
     warn(`poll failed: ${redact(e?.message, 200)}`);
+    state.lastError = `poll failed: ${redact(e?.message, 200)}`;
     return { status: "http_error", httpStatus: e?.status, backoffMs: null };
   }
   if (!got) return { status: "idle" };
@@ -570,18 +622,33 @@ export async function runOnce(cfg, prep, state = { wakers: new Set() }) {
   if (outcome.ok) {
     body = { jobId: task.jobId, page: task.page, ok: true, result: outcome.result, durationMs: outcome.durationMs };
     if (outcome.model) body.model = outcome.model;
+    state.loginOk = true;
+    state.limitUntil = null;
     log(`✓ ${short(task)} in ${(outcome.durationMs / 1000).toFixed(1)}s — ${outcome.result.components.length} components`);
   } else {
     body = { jobId: task.jobId, page: task.page, ok: false, error: redact(outcome.error, 500), retryable: outcome.retryable };
+    if (["usage_limit", "auth", "limit", "timeout", "invalid_output"].includes(outcome.kind)) body.kind = outcome.kind;
+    else body.kind = "error";
+    if (outcome.retryAt) body.retryAt = outcome.retryAt;
+    if (outcome.durationMs != null) body.durationMs = outcome.durationMs;
     if (outcome.kind === "auth") {
+      state.loginOk = false;
+      state.loginDetail = "Not logged in (reported by a conversion)";
       console.error("\n" + "!".repeat(72) + `\n!!  ${AUTH_HELP}\n` + "!".repeat(72) + "\n");
     }
+    state.lastError = body.error;
     warn(`✗ ${short(task)}: ${body.error}`);
   }
   const posted = await postResult(cfg, prep.info, body, state);
   let backoffMs = 0;
   if (outcome.kind === "auth") backoffMs = 60000;
-  else if (outcome.kind === "limit") backoffMs = 300000;
+  else if (outcome.kind === "usage_limit") {
+    // Wait for the reset (the server holds the queue too); unknown reset → re-check in 30 min.
+    const until = outcome.retryAt ? Date.parse(outcome.retryAt) : Date.now() + 30 * 60_000;
+    backoffMs = Math.min(8 * 24 * 3600_000, Math.max(60_000, until - Date.now()));
+    state.limitUntil = new Date(Date.now() + backoffMs).toISOString();
+    log(`Claude usage limit — pausing until ${state.limitUntil}`);
+  } else if (outcome.kind === "limit") backoffMs = 300000;
   return { status: "processed", outcome: { ...outcome, result: undefined }, posted, body, backoffMs };
 }
 
@@ -598,14 +665,89 @@ async function slotLoop(id, cfg, prep, state) {
       continue;
     }
     failDelay = 2000;
-    if (r.backoffMs) { log(`[slot ${id}] backing off ${r.backoffMs / 1000}s`); await sleep(r.backoffMs, state); }
+    if (r.backoffMs) {
+      log(`[slot ${id}] backing off ${Math.round(r.backoffMs / 1000)}s`);
+      await sleep(r.backoffMs, state);
+      if (r.outcome?.kind === "usage_limit") state.limitUntil = null; // the next attempt tells us whether it has reset
+    }
+  }
+}
+
+// ───────────────────────────── heartbeat ─────────────────────────────
+
+/**
+ * `claude auth status` (JSON; makes no model call, so it uses no plan usage). Returns { ok, detail }:
+ * ok=true only for a claude.ai subscription login (an API key would bypass the subscription and is stripped anyway).
+ */
+export async function checkLogin(claude, cwd) {
+  const r = await runChild(claude, ["auth", "status"], { cwd, timeoutMs: 30000 });
+  if (r.spawnError || r.timedOut) return { ok: null, detail: "auth status unavailable" };
+  const text = String(r.stdout || "");
+  let j = null;
+  try { j = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1)); } catch { /* not JSON */ }
+  if (!j || typeof j.loggedIn !== "boolean") {
+    if (AUTH_RE.test(`${text}\n${r.stderr}`)) return { ok: false, detail: "Not logged in" };
+    return { ok: null, detail: "auth status not understood" };
+  }
+  if (!j.loggedIn) return { ok: false, detail: "Not logged in" };
+  const method = String(j.authMethod || "unknown").slice(0, 30);
+  const plan = j.subscriptionType ? ` (${String(j.subscriptionType).slice(0, 20)})` : "";
+  return { ok: method === "claude.ai", detail: `${method}${plan}` };
+}
+
+export function heartbeatBody(prep, state) {
+  return {
+    host: (os.hostname().replace(/[^A-Za-z0-9._-]/g, "").slice(0, 60) || "pc"),
+    nodeVersion: process.version,
+    claudeVersion: prep.version,
+    loginOk: state.loginOk ?? null,
+    loginDetail: state.loginDetail ?? null,
+    limitUntil: state.limitUntil && Date.parse(state.limitUntil) > Date.now() ? state.limitUntil : null,
+    lastPollAt: state.lastPollAt ?? null,
+    lastError: state.lastError ? redact(state.lastError, 300) : null,
+    startedAt: state.startedAt,
+    busy: (state.current || 0) > 0,
+  };
+}
+
+async function sendHeartbeat(cfg, prep, state) {
+  const res = await fetch(`${cfg.workerUrl}/api/worker/heartbeat`, {
+    method: "POST",
+    headers: { ...headers(cfg, prep.info), "content-type": "application/json" },
+    body: JSON.stringify(heartbeatBody(prep, state)),
+    signal: AbortSignal.timeout(20000),
+    redirect: "error",
+  });
+  const text = await res.text().catch(() => "");
+  if (res.status === 404) return { unsupported: true }; // older server without the endpoint
+  if (!res.ok) throw new Error(`heartbeat → ${res.status} ${redact(text, 120)}`);
+  return JSON.parse(text || "{}");
+}
+
+async function heartbeatLoop(cfg, prep, state) {
+  let lastLoginCheck = 0;
+  let warnedUnsupported = false;
+  while (!state.stopping) {
+    if (Date.now() - lastLoginCheck >= LOGIN_CHECK_MS) {
+      lastLoginCheck = Date.now();
+      const l = await checkLogin(prep.claude, cfg.workDir).catch(() => ({ ok: null, detail: "auth status failed" }));
+      if (l.ok === false && state.loginOk !== false) console.error("\n" + "!".repeat(72) + `\n!!  ${AUTH_HELP}\n` + "!".repeat(72) + "\n");
+      if (l.ok !== null || state.loginOk === undefined) { state.loginOk = l.ok; state.loginDetail = l.detail; }
+    }
+    try {
+      const r = await sendHeartbeat(cfg, prep, state);
+      if (r.unsupported && !warnedUnsupported) { warnedUnsupported = true; warn("server has no /api/worker/heartbeat yet (older deployment) — heartbeat disabled until it does"); }
+    } catch (e) {
+      warn(`heartbeat failed: ${redact(e?.message, 160)}`);
+    }
+    await sleep(HEARTBEAT_MS, state);
   }
 }
 
 async function runForever(cfg) {
   const prep = await prepare(cfg);
-  log(`worker started: ${prep.info}; server ${cfg.workerUrl}; concurrency ${cfg.concurrency}; claude = ${prep.claude.display}${cfg.claudeModel ? `; model ${cfg.claudeModel}` : ""}`);
-  const state = { stopping: false, hardStop: false, wakers: new Set(), current: 0 };
+  log(`worker started: ${prep.info}; node ${process.version}; server ${cfg.workerUrl}; one page at a time; claude = ${prep.claude.display}${cfg.claudeModel ? `; model ${cfg.claudeModel}` : ""}`);
+  const state = { stopping: false, hardStop: false, wakers: new Set(), current: 0, startedAt: new Date().toISOString() };
   const wakeAll = () => { for (const w of [...state.wakers]) w(); };
   const onSignal = (sig) => {
     if (!state.stopping) {
@@ -627,7 +769,7 @@ async function runForever(cfg) {
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
   if (process.platform === "win32") process.on("SIGBREAK", onSignal);
-  await Promise.all(Array.from({ length: cfg.concurrency }, (_, i) => slotLoop(i + 1, cfg, prep, state)));
+  await Promise.all([heartbeatLoop(cfg, prep, state), ...Array.from({ length: cfg.concurrency }, (_, i) => slotLoop(i + 1, cfg, prep, state))]);
   log("worker stopped");
 }
 
@@ -672,6 +814,18 @@ export async function selfCheck(cfg) {
   } catch (e) {
     if (e instanceof HttpError && (e.status === 401 || e.status === 403)) step(false, `server rejected WORKER_TOKEN (${e.status})`);
     else step(false, `cannot reach ${cfg.workerUrl}: ${redact(e?.message, 200)}`);
+  }
+
+  const login = await checkLogin(prep.claude, cfg.workDir).catch(() => ({ ok: null, detail: "auth status failed" }));
+  if (login.ok === true) step(true, `claude auth status: ${login.detail}`);
+  else if (login.ok === false) step(false, `claude auth status: ${login.detail} — the worker needs a claude.ai login`);
+  else console.log(`  --   claude auth status: ${login.detail} (heartbeat will report login as unknown)`);
+  try {
+    const hb = await sendHeartbeat(cfg, prep, { loginOk: login.ok, loginDetail: login.detail, startedAt: new Date().toISOString(), current: 0 });
+    if (hb.unsupported) console.log("  --   server has no heartbeat endpoint yet (older deployment)");
+    else step(true, `server accepted the heartbeat${hb.paused ? " (conversions are PAUSED by an admin)" : ""}`);
+  } catch (e) {
+    step(false, `heartbeat failed: ${redact(e?.message, 200)}`);
   }
   console.log(ok ? "\nAll checks passed. Start the worker with: node worker/worker.mjs" : "\nSome checks failed.");
   return ok;

@@ -81,6 +81,7 @@ export default function Home() {
   const [held, setHeld] = useState<{ records: PageRecord[]; filename: string } | null>(null); // finished job waiting for a price list
   const [email, setEmail] = useState<string | null>(null);
   const [workerOnline, setWorkerOnline] = useState<boolean | null>(null);
+  const [status, setStatus] = useState<StatusView | null>(null);
   const [resumed, setResumed] = useState(false);
   const pdfInput = useRef<HTMLInputElement>(null);
   const priceInput = useRef<HTMLInputElement>(null);
@@ -196,9 +197,11 @@ export default function Home() {
     const tick = async () => {
       try {
         const s = await apiRequest<StatusView>("/api/status", { signal: ctrl.signal });
+        setStatus(s ?? null);
         setWorkerOnline(!!s?.workerOnline);
       } catch (e) {
         if (isAbortError(e) || e instanceof AuthError) return;
+        setStatus(null);
         setWorkerOnline(null);
       }
       if (!ctrl.signal.aborted) timer = setTimeout(tick, STATUS_POLL_MS);
@@ -296,6 +299,11 @@ export default function Home() {
           <span className="font-semibold">⚡ Panel BOM Pricer</span>
           <div className="flex min-w-0 items-center gap-2 text-sm">
             {email && <span className="truncate text-muted-foreground" title={email}>{email}</span>}
+            {status?.isAdmin && (
+              <a href="/admin" className="rounded-md px-2 py-1 font-medium text-sky-700 hover:bg-sky-50">
+                Worker
+              </a>
+            )}
             <Button size="sm" variant="outline" onClick={signOut}>Sign out</Button>
           </div>
         </div>
@@ -304,7 +312,7 @@ export default function Home() {
       <main className="mx-auto max-w-6xl space-y-6 px-4 py-6 sm:py-8">
         <header className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <p className="text-sm text-muted-foreground">Drop a control-panel drawing PDF and get a priced BOM in Excel, grouped by make.</p>
-          <StatusPill online={workerOnline} />
+          <StatusPill status={status} />
         </header>
 
         <div className="grid gap-4 md:grid-cols-3">

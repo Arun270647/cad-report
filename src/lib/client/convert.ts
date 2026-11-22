@@ -10,7 +10,9 @@ import type { CreateJobRequest, CreateJobResponse, JobPageView, JobView, UploadP
 
 /** Per-sheet progress shown as a badge. `stage` refines a "pending" page. */
 export interface PageProgress extends PageRecord {
-  stage?: "rendering" | "uploading" | "queued" | "reading";
+  stage?: "rendering" | "uploading" | "queued" | "reading" | "limit";
+  /** stage "limit": Claude usage limit; retried automatically after this time */
+  retryAt?: string;
 }
 
 export type ConversionPhase = "preparing" | "uploading" | "waiting" | "done";
@@ -175,6 +177,8 @@ export function pageFromView(v: JobPageView): PageProgress {
       return { page: v.page, status: "pending", stage: "queued" };
     case "processing":
       return { page: v.page, status: "pending", stage: "reading" };
+    case "waiting_limit":
+      return { page: v.page, status: "pending", stage: "limit", retryAt: v.retryAt ?? undefined };
     case "error":
       return { page: v.page, status: "error", error: v.error ?? "Could not read this sheet" };
     case "done": {

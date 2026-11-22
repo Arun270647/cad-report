@@ -51,9 +51,10 @@ and …"). The worker therefore runs Claude Code as a **pure function: image in 
 
 Recommended location: `R:\panel-bom-worker` (keeps scratch files off a small C: drive).
 
-1. Install **Node 22** (https://nodejs.org) and **Claude Code** (native installer, or
-   `npm install -g @anthropic-ai/claude-code`). Open a new PowerShell window and run `claude` once; log in with
-   the claude.ai account, then `/exit`.
+1. Install **Node 20+ machine-wide** (the nodejs.org installer → `C:\Program Files\nodejs`; Node 24 is in use) and
+   **Claude Code** (native installer, or `npm install -g @anthropic-ai/claude-code`). Avoid per-user Node installs
+   such as nvm that live in another user's profile — the task would break when that user changes versions.
+   Open a new PowerShell window and run `claude` once; log in with the claude.ai account, then `/exit`.
 2. Copy the contents of this `worker` folder to `R:\panel-bom-worker`.
 3. In that folder: `copy .env.example .env`, open `.env` in Notepad and paste `WORKER_TOKEN` (same value as in
    Vercel). Leave `CLAUDE_BIN` empty unless Claude Code is not found automatically.
@@ -64,25 +65,54 @@ Recommended location: `R:\panel-bom-worker` (keeps scratch files off a small C: 
    node worker.mjs --check
    ```
 
-   It verifies the config, the Claude Code flags, that Claude Code is logged in (one tiny no-tools prompt), and
-   that the server accepts the token — **without claiming a page** (see "Server requirement" below).
-5. Run it 24/7 with the Scheduled Task "PanelBomWorker":
+   It verifies the config, the Claude Code flags, that Claude Code is logged in (one tiny no-tools prompt and
+   `claude auth status`), that the server accepts the token — **without claiming a page** (see "Server requirement"
+   below) — and that the server accepts a heartbeat.
+5. Run it 24/7 with the Scheduled Task "PanelBomWorker" (uses `C:\Program Files\nodejs\node.exe` when present):
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\install-task.ps1
    ```
 
-   The task starts at logon of the current user, has no time limit, runs on battery, restarts on failure every
-   1 min (up to 999 times), and ignores a second instance. It runs `run-worker.cmd`, which also restarts the worker
-   60 s after any exit and appends output to `logs\worker.log`
-   (`Get-Content R:\panel-bom-worker\logs\worker.log -Wait -Tail 20`). A console window titled `PanelBomWorker`
-   stays open — minimise it, don't close it.
-   Variant without a window that also runs before anyone logs on: from an **elevated** PowerShell run
-   `.\install-task.ps1 -Hidden` (uses "run whether user is logged on or not", S4U, at startup).
-   Remove with `.\uninstall-task.ps1`. Only the task named `PanelBomWorker` is touched.
+   **At logon of the current user, no window.** The task runs `wscript launch-hidden.vbs`, which starts
+   `supervisor.mjs` with no console window. No admin needed. It does not run while that user is signed out.
 
-   Alternative: `npm i -g pm2 && pm2 start worker.mjs --name panel-bom-worker && pm2 save` (plus
-   `pm2-windows-startup` or similar for boot).
+   **At boot, whether or not anyone is logged on** (needs an administrator): from an **elevated** PowerShell,
+   register it for the account that holds the Claude Code login (S4U: no stored password, no window):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File R:\panel-bom-worker\install-task.ps1 -Hidden -User "PC-NAME\user"
+   ```
+
+   Both variants: no time limit, run on battery, Task Scheduler restarts the task every 1 min on failure (up to
+   999 times), a second instance is ignored. Re-running the script replaces the task and stops this folder's old
+   worker processes (including the old `run-worker.cmd` loop). Only the task named `PanelBomWorker` and processes
+   running this folder's worker are touched.
+
+   **Supervisor** (`supervisor.mjs`): restarts `worker.mjs` after any exit with exponential backoff
+   (10 s, 20 s, … up to 5 min; back to 5 s once it has run for 10 min) and writes all output to
+   **`logs\worker-YYYY-MM-DD.log`** — a new file every day, files older than 14 days (`LOG_KEEP_DAYS`) are deleted.
+   Follow today's log: `Get-Content R:\panel-bom-worker\logs\worker-$(Get-Date -f yyyy-MM-dd).log -Wait -Tail 20`.
+   `run-worker.cmd` runs the same supervisor in a console window by hand.
+
+   Stop: `Stop-ScheduledTask PanelBomWorker` then `.\uninstall-task.ps1` (removes the task and ends the processes).
+   To pause conversions without stopping the PC worker, use **Pause** on the admin Worker page.
+
+6. **Keep the PC awake.** The worker can only poll while Windows is running. On mains power set sleep and hibernate
+   to *Never* (Settings → System → Power & sleep, or from PowerShell):
+
+   ```powershell
+   powercfg /change standby-timeout-ac 0
+   powercfg /change hibernate-timeout-ac 0
+   # laptops only — keep working with the lid closed on mains power:
+   powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+   powercfg /setactive SCHEME_CURRENT
+   ```
+
+   Check with `powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE` ("Current AC Power Setting Index: 0x00000000"
+   = never). The current worker PC (a desktop on the Balanced plan) already has AC sleep and hibernate set to never.
+   Also keep Windows Update's active hours / restart options so it does not reboot into a signed-out state
+   (with the at-logon task the worker only resumes after the user signs in again).
 
 ## Setup — Linux / macOS
 
@@ -137,15 +167,26 @@ Make sure `claude` is on the service's PATH (or set `CLAUDE_BIN=/full/path/to/cl
 | `CLAUDE_MODEL` | Claude Code default | Passed as `--model` |
 | `POLL_INTERVAL_MS` | 5000 | Idle poll interval |
 | `TASK_TIMEOUT_MS` | 480000 | Per-page timeout |
-| `CONCURRENCY` | 1 | Pages in parallel (max 3) |
 | `WORK_DIR` | `<worker folder>/tmp` | Per-page scratch folders |
+| `LOG_KEEP_DAYS` | 14 | Supervisor: days of `logs\worker-YYYY-MM-DD.log` to keep |
+
+Pages are always processed **one at a time** (the old `CONCURRENCY` setting is ignored); the server enforces the
+same, so parallel uploads queue up instead of hitting plan limits together.
 
 ## Behaviour
 
-* `204` → sleep `POLL_INTERVAL_MS`. Network errors / 5xx → exponential backoff up to 60 s; never crashes.
+* `204` → sleep `POLL_INTERVAL_MS` (also while an admin has paused conversions or a usage limit is active).
+  Network errors / 5xx → exponential backoff up to 60 s; never crashes.
 * `401/403` → "server rejected WORKER_TOKEN", retry every 60 s.
-* Claude not logged in → big console warning *"Claude Code is not logged in — run `claude` once and log in"*,
-  the page is reported `ok:false, retryable:true`, 60 s pause. Usage/rate limit → 5 min pause.
+* **Heartbeat** every 60 s (`POST /api/worker/heartbeat`): Node and Claude Code versions, whether the claude.ai login
+  is still valid (`claude auth status` every 5 min — no model call, no plan usage), last poll, last error, limit state.
+  The admin Worker page shows Online / Degraded / Offline from it.
+* Claude not logged in → big log warning *"Claude Code is not logged in — run `claude` once and log in"*, the page
+  goes back to the queue **without using up an attempt**, 60 s pause, and the admin page shows "logged out".
+* **Plan usage limit** (Claude Code says e.g. "usage limit reached … resets 3pm") → the reset time is parsed, the page
+  is reported `kind: "usage_limit"` and shown to the user as **"Waiting – usage limit"** (not failed, attempt not
+  counted); the worker and the server hold the whole queue until the reset and then continue automatically.
+  Short transient limits (429 / overloaded) → 5 min pause and a normal retry.
 * Invalid/unparseable output or timeout → `ok:false, retryable:true` (the server retries up to 3 attempts).
 * Ctrl+C / SIGTERM: stop taking new pages, finish the current one (max 30 s); a second Ctrl+C aborts. Abandoned
   pages are re-queued by the server after 10 min.
@@ -160,4 +201,4 @@ and returns a task, `--check` reports it; that page is re-queued after 10 min.
 ## Tests
 
 `worker/fake-claude.mjs` is a stand-in `claude` CLI used by `tests/worker.test.ts`
-(`FAKE_CLAUDE_MODE=ok|garbage|notloggedin|slow|fenced`). Run `npx vitest run tests/worker.test.ts`.
+(`FAKE_CLAUDE_MODE=ok|garbage|notloggedin|usagelimit|slow|fenced`). Run `npx vitest run tests/worker.test.ts`.

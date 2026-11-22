@@ -69,6 +69,7 @@ function isPublic(pathname: string): boolean {
   if (pathname === "/login" || pathname.startsWith("/login/")) return true;
   if (pathname === "/api/session") return true;
   if (pathname.startsWith("/api/worker/")) return true; // bearer-token auth in the handlers
+  if (pathname.startsWith("/api/cron/")) return true; // CRON_SECRET bearer auth in the handlers
   if (pathname.startsWith("/_next/")) return true;
   if (pathname === "/favicon.ico") return true;
   // static files from /public (e.g. pdf.js worker, icons) — never API routes

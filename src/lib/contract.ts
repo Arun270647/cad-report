@@ -4,8 +4,9 @@
  */
 import type { PageExtraction } from "./bom/types";
 
-export type PageStatus = "skipped" | "awaiting_upload" | "pending" | "processing" | "done" | "error";
-export type JobStatus = "uploading" | "queued" | "processing" | "done";
+/** waiting_limit = Claude plan usage limit hit; retried automatically at retryAt (does not use up an attempt). */
+export type PageStatus = "skipped" | "awaiting_upload" | "pending" | "processing" | "waiting_limit" | "done" | "error";
+export type JobStatus = "uploading" | "queued" | "processing" | "waiting_limit" | "done";
 
 export interface JobPageView {
   page: number;
@@ -13,6 +14,7 @@ export interface JobPageView {
   skipReason: string | null;
   error: string | null;
   result: PageExtraction | null; // only when status === "done"
+  retryAt?: string | null; // only when status === "waiting_limit"
 }
 
 export interface JobView {
@@ -21,13 +23,19 @@ export interface JobView {
   status: JobStatus;
   createdAt: string;
   pages: JobPageView[];
-  queuePosition: number; // number of pending pages from OTHER/older jobs ahead of this job's first pending page
+  queuePosition: number; // queued pages of OLDER jobs that will be read before this job's pages
 }
 
+export type WorkerState = "online" | "degraded" | "offline";
+
 export interface StatusView {
-  workerOnline: boolean; // worker polled within the last 90 s
+  workerOnline: boolean; // worker seen within the last 5 min (heartbeat every 60 s)
+  workerState: WorkerState;
   workerLastSeen: string | null;
   pendingPages: number;
+  paused: boolean; // conversions paused by an admin
+  limitUntil: string | null; // Claude usage limit: the queue resumes at this time
+  isAdmin: boolean;
 }
 
 /* Browser → API */
@@ -46,6 +54,58 @@ export interface WorkerTask {
   mediaType: "image/png" | "image/jpeg";
   data: string; // base64
 }
+export type WorkerFailureKind = "usage_limit" | "auth" | "limit" | "timeout" | "invalid_output" | "error";
 export type WorkerResultRequest =
   | { jobId: string; page: number; ok: true; result: PageExtraction; model?: string; durationMs?: number }
-  | { jobId: string; page: number; ok: false; error: string; retryable: boolean };
+  | { jobId: string; page: number; ok: false; error: string; retryable: boolean; kind?: WorkerFailureKind; retryAt?: string; durationMs?: number };
+
+/** POST /api/worker/heartbeat (every 60 s). Response: { ok: true, paused: boolean }. */
+export interface WorkerHeartbeatRequest {
+  host: string;
+  nodeVersion: string;
+  claudeVersion: string;
+  loginOk: boolean | null; // from `claude auth status` (uses no plan usage); null = unknown
+  loginDetail: string | null; // e.g. "claude.ai (team)"
+  limitUntil: string | null; // worker is waiting for a usage-limit reset until then
+  lastPollAt: string | null;
+  lastError: string | null;
+  startedAt: string;
+  busy: boolean;
+}
+
+/* Admin (session + ADMIN_EMAILS) */
+export interface AdminJobRow {
+  id: string;
+  filename: string;
+  email: string;
+  status: JobStatus;
+  createdAt: string;
+  pages: number; // pages sent to Claude (not skipped)
+  done: number;
+  errors: number;
+  waiting: number; // waiting_limit
+  claudeMs: number; // sum of Claude Code time over finished pages
+  wallMs: number | null; // created → last page finished (null while running)
+  lastError: string | null;
+}
+export interface AdminAlert { kind: string; message: string; openedAt: string; resolvedAt: string | null }
+export interface AdminWorkerView {
+  state: WorkerState;
+  reasons: string[];
+  lastSeen: string | null;
+  lastPoll: string | null;
+  host: string | null;
+  nodeVersion: string | null;
+  claudeVersion: string | null;
+  loginOk: boolean | null;
+  loginDetail: string | null;
+  limitUntil: string | null;
+  lastError: string | null;
+  startedAt: string | null;
+  paused: boolean;
+  pausedBy: string | null;
+  pausedAt: string | null;
+  queue: { pending: number; processing: number; waitingLimit: number };
+  jobs: AdminJobRow[];
+  alerts: AdminAlert[]; // open first, then the 10 most recent resolved
+}

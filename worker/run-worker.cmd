@@ -1,16 +1,12 @@
 @echo off
-rem Keeps the worker running: restarts it 60 s after any exit. Output goes to logs\worker.log.
-rem Usage: run-worker.cmd ["C:\path\to\node.exe"]   (default: node on PATH)
+rem Runs the worker in this console window via the supervisor (restart with backoff, daily logs in logs\).
+rem The scheduled task does NOT use this file (see install-task.ps1); it is for running by hand.
+rem Usage: run-worker.cmd ["C:\path\to\node.exe"]   (default: C:\Program Files\nodejs\node.exe, else node on PATH)
 setlocal
 title PanelBomWorker
 cd /d "%~dp0"
 set "NODE_EXE=%~1"
+if "%NODE_EXE%"=="" if exist "%ProgramFiles%\nodejs\node.exe" set "NODE_EXE=%ProgramFiles%\nodejs\node.exe"
 if "%NODE_EXE%"=="" set "NODE_EXE=node"
-if not exist "%~dp0logs" mkdir "%~dp0logs"
-:loop
-echo [%date% %time%] starting worker>> "%~dp0logs\worker.log"
-"%NODE_EXE%" "%~dp0worker.mjs" >> "%~dp0logs\worker.log" 2>&1
-echo [%date% %time%] worker exited with code %errorlevel%; restarting in 60 s>> "%~dp0logs\worker.log"
-rem ping instead of timeout: timeout fails without an interactive console.
-ping -n 61 127.0.0.1 >nul
-goto loop
+echo Worker running; output goes to %~dp0logs\worker-YYYY-MM-DD.log. Press Ctrl+C to stop.
+"%NODE_EXE%" "%~dp0supervisor.mjs"

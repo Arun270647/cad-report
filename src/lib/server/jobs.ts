@@ -98,6 +98,9 @@ export const WorkerResultZod = z.discriminatedUnion("ok", [
     ok: z.literal(false),
     error: z.string().max(20_000),
     retryable: z.boolean(),
+    kind: z.enum(["usage_limit", "auth", "limit", "timeout", "invalid_output", "error"]).optional(),
+    retryAt: z.string().datetime({ offset: true }).optional(),
+    durationMs: z.number().nonnegative().optional(),
   }),
 ]);
 
@@ -105,6 +108,29 @@ export const WorkerResultZod = z.discriminatedUnion("ok", [
 export function failureOutcome(retryable: boolean, attempts: number): "pending" | "error" {
   return retryable && attempts < MAX_ATTEMPTS ? "pending" : "error";
 }
+
+/** Usage-limit resets: never trust the worker blindly — at least 1 min, at most 8 days; unknown → 30 min. */
+export const LIMIT_MIN_WAIT_MS = 60_000;
+export const LIMIT_MAX_WAIT_MS = 8 * 24 * 3600_000;
+export const LIMIT_DEFAULT_WAIT_MS = 30 * 60_000;
+export function resolveRetryAt(retryAt: string | null | undefined, now = Date.now()): Date {
+  const t = retryAt ? Date.parse(retryAt) : NaN;
+  const wait = Number.isFinite(t) ? t - now : LIMIT_DEFAULT_WAIT_MS;
+  return new Date(now + Math.min(LIMIT_MAX_WAIT_MS, Math.max(LIMIT_MIN_WAIT_MS, wait)));
+}
+
+export const WorkerHeartbeatZod = z.object({
+  host: z.string().max(100),
+  nodeVersion: z.string().max(40),
+  claudeVersion: z.string().max(40),
+  loginOk: z.boolean().nullable(),
+  loginDetail: z.string().max(200).nullable(),
+  limitUntil: z.string().datetime({ offset: true }).nullable(),
+  lastPollAt: z.string().datetime({ offset: true }).nullable(),
+  lastError: z.string().max(500).nullable(),
+  startedAt: z.string().datetime({ offset: true }),
+  busy: z.boolean(),
+});
 
 /* ---------- job status ---------- */
 
@@ -124,6 +150,8 @@ export interface PageCounts {
   awaiting_upload: number;
   pending: number;
   processing: number;
+  /** usage limit hit; retried automatically (optional for older callers: 0) */
+  waiting_limit?: number;
   done: number;
   error: number;
   /** pages that have been claimed at least once (attempts > 0) */
@@ -132,20 +160,24 @@ export interface PageCounts {
 
 /**
  * Job status rule (contract): uploading until every non-skipped page is uploaded, then queued;
- * processing once any page has been claimed; done when nothing is awaiting_upload/pending/processing.
+ * processing while a page is being read; waiting_limit when the only unfinished work is waiting for a
+ * Claude usage-limit reset; done when nothing is awaiting_upload/pending/processing/waiting_limit.
  * MUST match the SQL in refreshJobStatus().
  */
 export function deriveJobStatus(c: PageCounts): JobStatus {
+  const waiting = c.waiting_limit ?? 0;
   if (c.awaiting_upload > 0) return "uploading";
-  if (c.pending + c.processing === 0) return "done";
-  if (c.processing > 0 || c.done > 0 || c.error > 0 || c.started > 0) return "processing";
+  if (c.pending + c.processing + waiting === 0) return "done";
+  if (c.processing > 0) return "processing";
+  if (waiting > 0) return "waiting_limit";
+  if (c.done > 0 || c.error > 0 || c.started > 0) return "processing";
   return "queued";
 }
 
 export function countPages(pages: { status: PageStatus; attempts: number }[]): PageCounts {
-  const c: PageCounts = { skipped: 0, awaiting_upload: 0, pending: 0, processing: 0, done: 0, error: 0, started: 0 };
+  const c: Required<PageCounts> = { skipped: 0, awaiting_upload: 0, pending: 0, processing: 0, waiting_limit: 0, done: 0, error: 0, started: 0 };
   for (const p of pages) {
-    c[p.status] += 1;
+    if (p.status in c) c[p.status] += 1;
     if (p.attempts > 0) c.started += 1;
   }
   return c;
@@ -159,8 +191,10 @@ export async function refreshJobStatus(db: Db, jobId: string): Promise<void> {
       FROM (
         SELECT CASE
                  WHEN bool_or(status = 'awaiting_upload') THEN 'uploading'
-                 WHEN NOT bool_or(status IN ('pending', 'processing')) THEN 'done'
-                 WHEN bool_or(status IN ('processing', 'done', 'error') OR attempts > 0) THEN 'processing'
+                 WHEN NOT bool_or(status IN ('pending', 'processing', 'waiting_limit')) THEN 'done'
+                 WHEN bool_or(status = 'processing') THEN 'processing'
+                 WHEN bool_or(status = 'waiting_limit') THEN 'waiting_limit'
+                 WHEN bool_or(status IN ('done', 'error') OR attempts > 0) THEN 'processing'
                  ELSE 'queued'
                END AS status
           FROM bom.job_pages
