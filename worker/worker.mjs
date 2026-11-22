@@ -434,7 +434,12 @@ async function fetchNext(cfg, info, { probe = false } = {}) {
     method: "GET", headers: headers(cfg, info), signal: AbortSignal.timeout(30000), redirect: "error",
   });
   if (res.status === 204) { await res.body?.cancel(); return null; }
-  if (res.status === 200) return { status: 200, task: await res.json() };
+  if (res.status === 200) {
+    const body = await res.json();
+    // The server answers ?probe=1 with {ok:true} (auth + heartbeat only, nothing claimed).
+    if (probe && body && body.ok === true && !body.jobId) return null;
+    return { status: 200, task: body };
+  }
   const body = redact(await res.text().catch(() => ""), 200);
   throw new HttpError(res.status, `GET /api/worker/next → ${res.status} ${body}`);
 }

@@ -1,81 +1,76 @@
 # Panel BOM Pricer
 
-Drag in an electrical control-panel drawing PDF and get back a priced Bill of Materials (BOM) in Excel, grouped by MAKE.
+Drag in an electrical control-panel drawing PDF and get back a priced Bill of Materials in Excel, grouped by MAKE.
 
-* **No sign-in, no database, no admin screens.** It is a single page.
-* **Claude reads the drawings.** It reads each sheet through the Claude API. The key is stored only as a Vercel environment variable and is used server-side; it is never sent to the browser or committed to the repo.
-* **Plain code does the rest.** Matching, pricing and the Excel output run as deterministic code in your browser. The price list never leaves your machine.
+* **Restricted access:** only the email addresses in `ALLOWED_EMAILS` can open the site. The site asks for the email first.
+* **Drawings are read by Claude Code on your own PC.** It runs on your claude.ai login, so there is **no API key and no API bill**. The PC polls the website for work over outbound HTTPS and never accepts inbound connections.
+* **Matching, pricing and Excel run in your browser.** The price list never leaves your machine.
+
+```
+Browser (allowed email)                Vercel (this app)                    Your Windows PC (24/7)
+renders PDF pages → PNG   ── upload ──▶ job queue in Postgres  ◀── polls ── worker/worker.mjs
+polls job status          ◀─────────── results (validated)     ◀── posts ── claude -p --tools "" (no tools)
+builds the Excel locally
+```
 
 ## Using it
 
-1. Open the site.
-2. Drop your **price list (.xlsx)** into the right-hand box. You only do this once, because the browser remembers it. Drop a new one to replace it.
-3. Drop the **drawing PDF** into the big box. Optionally change the margin (12.5% by default).
-4. Click **Convert to Excel**. Each sheet shows its progress: RESERVED and blank sheets are skipped, and the others are read by Claude, two at a time.
-5. Review the on-screen summary, device counts and checks, then click **Download …_BOM.xlsx**.
+1. Open the site and enter your email.
+2. Drop your **price list (.xlsx)**. You only do this once, because the browser remembers it.
+3. Drop the **drawing PDF**, adjust the margin if needed (12.5% by default), and click **Convert**.
+4. Watch the progress. RESERVED and blank sheets are skipped in the browser. The other sheets show *uploading*, then *waiting in queue*, then *reading on PC*, then *done*. The pill at the top shows whether your PC worker is online. If it is offline, jobs wait in the queue until it comes back. If you close the tab, the job resumes when you reopen it.
+5. Click **Download …_BOM.xlsx**.
 
 ### The price list
 
-The first sheet needs a header row with these columns: `TEREX P/N, WHERE USED, DRG SHEET NO, DESCRIPTION, MANUFACTURE P/N, MAKE, UOM, QTY, LIST PRICE, Disc, Unit price, Margin, Terex Unit price, Total Price, TAG NO`. Discounts can be written as `0.35`, `35` or `35%`.
+The first sheet needs a header row with these columns: `TEREX P/N, WHERE USED, DRG SHEET NO, DESCRIPTION, MANUFACTURE P/N, MAKE, UOM, QTY, LIST PRICE, Disc, Unit price, Margin, Terex Unit price, Total Price, TAG NO`.
 
-**Matching rules are optional.** Add a sheet whose name contains `RULES`, with the columns `Device type | Rating | Qualifier | Manufacturer P/N`, for example:
-
-| Device type | Rating | Qualifier | Manufacturer P/N |
-|---|---|---|---|
-| MPCB | 13-18A | | GV2ME20 |
-| CONTACTOR | 18A | 24VDC | LC1D18BD |
-| PILOT_LAMP | - | GREEN | XB7NV63 |
-
-Without rules, the app matches on a part number printed on the drawing, or on the device keyword plus the **exact** rating (and colour/function for lamps and pushbuttons) appearing in the price-list DESCRIPTION. `samples/sample-price-file.xlsx` shows the format, including a RULES sheet.
+**Matching rules are optional.** Add a sheet whose name contains `RULES`, with the columns `Device type | Rating | Qualifier | Manufacturer P/N` (e.g. `MPCB | 13-18A | | GV2ME20`, `PILOT_LAMP | - | GREEN | XB7NV63`). `samples/sample-price-file.xlsx` shows the format.
 
 ### What the Excel contains
 
-* Columns A–N in the template layout, with **live formulas**: `K = I-(I*J)`, `M = K+(K*L)`, `N = H*M`.
-* **Grouped by MAKE:** makes in alphabetical order, with generic entries (REPUTED, LABOUR, NON-STOCK, unspecified) last. Each make has a header row, its items and a `SUBTOTAL` (`=SUM(...)`). The `GRAND TOTAL` is the sum of the subtotal cells. A summary table follows: Make | Line count | Subtotal | % of total.
-* Calibri 10, thin borders, yellow header row, discounts and margins as %, prices with thousand separators.
-* **Never a guessed price:** if there is no exact rating match, the price is left blank and the cell is filled yellow.
-* **Price conflicts** (same part, different prices) use the row with a Terex P/N. The alternatives are listed in the cell comment.
-* Drawing notes, anomalies and conflicts appear as cell comments on the DESCRIPTION cell.
+* Columns A–N with **live formulas**: `K = I-(I*J)`, `M = K+(K*L)`, `N = H*M`.
+* **Grouped by MAKE:** makes alphabetical, with REPUTED, LABOUR, NON-STOCK and unspecified last. Each make has a header, its items and a `SUBTOTAL`. The `GRAND TOTAL` is the sum of the subtotals, followed by a summary table: Make | Line count | Subtotal | % of total.
+* Calibri 10, thin borders, yellow header row, % formats, thousand separators.
+* **Never a guessed price:** with no exact rating match the price stays blank (yellow cell). With conflicting price rows, the row with a Terex P/N is used and the alternatives go into the cell comment.
+* The page also shows device counts (lamps by colour, pushbuttons by function, relays by type, terminals per block) and drawing anomalies (duplicate tags, terminal clashes, protection below motor FLC).
 
-The page also reports pilot lamps by colour, pushbuttons by function, relays by type, terminals per block, and drawing anomalies: duplicate tags, terminal-number clashes, and protection settings below the motor FLC.
+## Setting up the PC worker (one time)
 
-## Setup (Vercel)
+See **[worker/README.md](worker/README.md)**. In short, on the Windows PC:
 
-Set these in **Vercel → Project → Settings → Environment Variables**, then redeploy:
+1. Copy the `worker` folder to `R:\panel-bom-worker`.
+2. Copy `.env.example` to `.env` and set `WORKER_URL=https://panel-bom-pricer.vercel.app` and `WORKER_TOKEN=<the token in Vercel>`.
+3. Run `node worker.mjs --check`. It verifies Claude Code is logged in and can reach the site.
+4. Run `powershell -ExecutionPolicy Bypass -File install-task.ps1` to keep it running 24/7 through Task Scheduler.
 
-| Variable | Required | Description |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | ✅ | Your Claude API key from <https://console.anthropic.com> → API keys. Billed per use. |
-| `ANTHROPIC_MODEL` | optional | Defaults to `claude-opus-5-5`. |
-| `APP_PASSCODE` | optional | If set, the site asks for this passcode once per browser. Recommended, because without it anyone with the URL can spend your API credit. |
+### Why this is safe to run on your PC
 
-No other configuration is needed. The only server code is `src/app/api/extract/route.ts`, which takes one sheet image and returns the JSON. It retries with backoff on rate-limit, overload and timeout errors.
+Drawings come from the website and could contain hidden prompt-injection text. The worker therefore runs Claude Code as a pure "image in → JSON out" function:
 
-## Local development
+* `--tools ""` (no tools at all), `--restricted`, `--strict-mcp-config`, no session persistence;
+* a fresh empty temporary folder for each task, in a sanitised environment (no API keys, no worker token);
+* the PC never parses PDFs (it only receives PNG/JPEG images);
+* the output is validated against a strict schema on the server before anyone sees it.
+
+## Vercel environment variables
+
+| Variable | Purpose |
+|---|---|
+| `ALLOWED_EMAILS` | Comma-separated emails allowed to sign in. |
+| `SESSION_SECRET` | Random string (≥ 32 chars) that signs the login cookie. |
+| `WORKER_TOKEN` | Random string (≥ 32 chars) shared with the PC worker. |
+| `DATABASE_URL` | Postgres (Supabase pooler, role `bom_app`, schema `bom`). Tables are in `docs/CONTRACT.md`. |
+
+Email-only sign-in means that anyone who knows an allowed email can get in. Failed attempts are rate-limited (10 per 15 minutes per IP).
+
+## Development
 
 ```bash
 npm install
-echo "ANTHROPIC_API_KEY=sk-ant-..." > .env.local   # git-ignored
-npm run dev            # http://localhost:3000
-npm test               # unit tests + end-to-end export test
+npm test               # 42 tests: matching/Excel end-to-end, server logic, worker (with a fake claude CLI)
+npm run dev
 npm run seed:samples   # regenerate samples/
 ```
 
-## Tests and sample data
-
-* `samples/sample-drawing.pdf`: a 4-sheet panel drawing (sheet 3 is RESERVED).
-* `samples/sample-price-file.xlsx`: a price list containing one conflict, one duplicate and a RULES sheet.
-* `tests/e2e-export.test.ts`: runs the whole pipeline on the samples, replaying Claude's per-sheet output from `tests/fixtures/sample-extraction.json` so it makes no API calls. It then re-opens the generated Excel and checks the following:
-  * the make order, header rows and SUBTOTAL ranges;
-  * that every formula evaluates to the hand-computed values (grand total 80,572.50 = sum of the subtotals, percentages add up to 100%);
-  * the styling, the yellow unpriced cells and the comments.
-
-## Project layout
-
-```
-src/app/page.tsx              the whole UI (drag & drop, progress, preview, download)
-src/app/api/extract/route.ts  the only server endpoint (holds the API key)
-src/lib/server/extract.ts     Claude call: prompt, strict JSON schema, retries
-src/lib/client/               browser PDF rendering (pdf.js) + conversion driver
-src/lib/bom/                  aggregation, matching, group-by-make, Excel, validation, price-file parsing
-```
+Key files: `docs/CONTRACT.md` (architecture and API), `src/app/page.tsx` (UI), `src/app/api/**` (session, jobs, worker endpoints), `src/lib/bom/**` (matching and Excel), `worker/worker.mjs` (PC worker).
