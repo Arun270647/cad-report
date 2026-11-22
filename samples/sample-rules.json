@@ -1,0 +1,104 @@
+[
+  {
+    "deviceType": "MPCB",
+    "rating": "13-18A",
+    "qualifier": null,
+    "mpn": "GV2ME20"
+  },
+  {
+    "deviceType": "MPCB",
+    "rating": "4–6.3A",
+    "qualifier": null,
+    "mpn": "GV2ME10"
+  },
+  {
+    "deviceType": "CONTACTOR",
+    "rating": "18A",
+    "qualifier": "24VDC",
+    "mpn": "LC1D18BD"
+  },
+  {
+    "deviceType": "CONTACTOR",
+    "rating": "9A",
+    "qualifier": "24VDC",
+    "mpn": "LC1D09BD"
+  },
+  {
+    "deviceType": "MCCB",
+    "rating": "100A",
+    "qualifier": null,
+    "mpn": "LV429771"
+  },
+  {
+    "deviceType": "MCB",
+    "rating": "6A",
+    "qualifier": null,
+    "mpn": "5SL6206-7"
+  },
+  {
+    "deviceType": "POWER_SUPPLY",
+    "rating": "24VDC 5A",
+    "qualifier": null,
+    "mpn": "6EP1333-2BA20"
+  },
+  {
+    "deviceType": "CONTROL_RELAY",
+    "rating": "-",
+    "qualifier": "24VDC",
+    "mpn": "40.52.9.024.0000"
+  },
+  {
+    "deviceType": "CONTROL_RELAY",
+    "rating": "-",
+    "qualifier": "230VAC",
+    "mpn": "55.34.8.230.0040"
+  },
+  {
+    "deviceType": "PILOT_LAMP",
+    "rating": "-",
+    "qualifier": "GREEN",
+    "mpn": "XB7NV63"
+  },
+  {
+    "deviceType": "PILOT_LAMP",
+    "rating": "-",
+    "qualifier": "RED",
+    "mpn": "XB7NV64"
+  },
+  {
+    "deviceType": "PILOT_LAMP",
+    "rating": "-",
+    "qualifier": "AMBER",
+    "mpn": "XB7NV65"
+  },
+  {
+    "deviceType": "PUSHBUTTON",
+    "rating": "-",
+    "qualifier": "START",
+    "mpn": "XB7NA31"
+  },
+  {
+    "deviceType": "PUSHBUTTON",
+    "rating": "-",
+    "qualifier": "STOP",
+    "mpn": "XB7NA42"
+  },
+  {
+    "deviceType": "EMERGENCY_STOP",
+    "rating": "-",
+    "qualifier": null,
+    "mpn": "XB7NS8445"
+  },
+  {
+    "deviceType": "TERMINAL",
+    "rating": "2.5sqmm",
+    "qualifier": null,
+    "mpn": "3044076"
+  },
+  {
+    "deviceType": "TERMINAL",
+    "rating": "4sqmm",
+    "qualifier": null,
+    "mpn": "3044131"
+  }
+]
