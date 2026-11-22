@@ -4,7 +4,7 @@ import { getSettings } from "@/lib/settings";
 
 export const maxDuration = 60;
 
-/** Vercel Cron (every 5 minutes, see vercel.json). Vercel sends "Authorization: Bearer $CRON_SECRET". */
+/** Vercel Cron (see vercel.json: daily on Hobby; use "*/5 * * * *" on Pro). Vercel sends "Authorization: Bearer $CRON_SECRET". */
 export const GET = handle(async (req: Request) => {
   const secret = process.env.CRON_SECRET;
   if (!secret || req.headers.get("authorization") !== `Bearer ${secret}`) return json({ error: "Unauthorized" }, 401);

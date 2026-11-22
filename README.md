@@ -81,7 +81,7 @@ Migrations in `drizzle/` are applied automatically by `npm run build` (`scripts/
 2. In Vercel, import the repository with the Next.js framework preset.
 3. Add the environment variables listed above.
 4. Deploy. The build applies the migrations, then runs `next build`.
-5. `vercel.json` schedules the health check every 5 minutes (`*/5 * * * *`). On the Vercel Hobby plan, cron jobs may run at most once a day. If the deploy is rejected because of the schedule, change it to a daily one (e.g. `0 3 * * *`). The status card also uses the results of real calls and of the **Test connection** button.
+5. **Health-check cron:** this deployment is on the Vercel **Hobby** plan, which only allows daily cron jobs, so `vercel.json` runs `/api/cron/health` once a day (`17 3 * * *`). On **Pro**, change the schedule to `*/5 * * * *` for the 5-minute check. Either way, the live status card also uses the results of every real extraction call and of the **Test connection** button (status is *Down* if the latest check failed, and *Degraded* if 20% or more of calls in the last hour failed or responses are slow).
 
 ### 3. Create the first admin
 
