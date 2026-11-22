@@ -509,9 +509,12 @@ export async function prepare(cfg) {
   SECRET_TOKEN = cfg.token;
   const claude = resolveClaude(cfg.claudeBin);
   await mkdir(cfg.workDir, { recursive: true });
-  // Leftovers from a crash / hard kill (one worker per WORK_DIR).
+  // Leftovers from a crash / hard kill. Only old ones, so a `--check` next to a running worker is harmless.
+  const cutoff = Date.now() - cfg.taskTimeoutMs - 10 * 60 * 1000;
   for (const name of await readdir(cfg.workDir).catch(() => [])) {
-    if (/^(task|check)-/.test(name)) await rm(path.join(cfg.workDir, name), { recursive: true, force: true }).catch(() => {});
+    if (!/^(task|check)-/.test(name)) continue;
+    const p = path.join(cfg.workDir, name);
+    try { if (statSync(p).mtimeMs < cutoff) await rm(p, { recursive: true, force: true }); } catch { /* ignore */ }
   }
   const missing = await missingFlags(claude, cfg.workDir);
   if (missing.length) {
