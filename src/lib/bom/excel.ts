@@ -43,7 +43,7 @@ export interface ExportLayout {
 }
 
 export interface ExportResult {
-  buffer: Buffer;
+  buffer: Uint8Array;
   layout: ExportLayout;
   grouped: GroupedBom;
 }
@@ -63,7 +63,7 @@ function styleRow(row: ExcelJS.Row, cols = 14) {
  */
 export async function buildWorkbook(
   lines: BomLine[],
-  opts: { template?: Buffer | null; title?: string } = {},
+  opts: { template?: ArrayBuffer | Uint8Array | null; title?: string } = {},
 ): Promise<ExportResult> {
   const grouped = groupByMake(lines);
   const wb = new ExcelJS.Workbook();
@@ -221,6 +221,6 @@ export async function buildWorkbook(
   tot.getCell(7).numFmt = PCT;
 
   if (opts.title) ws.headerFooter = { ...(ws.headerFooter ?? {}), oddHeader: `&L${opts.title.replace(/&/g, "&&")}` };
-  const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+  const buffer = new Uint8Array(await wb.xlsx.writeBuffer());
   return { buffer, layout, grouped };
 }

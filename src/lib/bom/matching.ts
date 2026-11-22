@@ -45,15 +45,25 @@ export function findRuleMpns(g: ComponentGroup, rules: RuleLike[]): string[] {
 
 function descriptionFallback(g: ComponentGroup, items: PriceRow[]): PriceRow[] {
   const kws = DEVICE_KEYWORDS[g.deviceType];
-  if (!kws || !g.ratingNorm || g.ratingNorm.length < 2) return [];
-  const rating = g.ratingNorm;
-  const ratingRe = new RegExp(`(^|[^0-9.])${rating.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[^0-9.])`);
+  if (!kws) return [];
   const quals = [g.colour, g.coilVoltage].filter(Boolean).map((q) => normText(q));
+  const rating = g.ratingNorm;
+  if (rating) {
+    if (rating.length < 2) return [];
+    const ratingRe = new RegExp(`(^|[^0-9.])${rating.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[^0-9.])`);
+    return items.filter((it) => {
+      const d = normText(it.description);
+      if (!kws.some((k) => d.includes(k))) return false;
+      if (!ratingRe.test(d)) return false; // exact rating only — never substitute
+      return quals.every((q) => d.includes(q));
+    });
+  }
+  // Ratingless devices (lamps, pushbuttons, e-stops): keyword + every qualifier (colour / function) must appear.
+  const fq = [...quals, g.fn ? normText(g.fn) : null].filter((x): x is string => !!x);
+  if (!fq.length && g.deviceType !== "EMERGENCY_STOP") return [];
   return items.filter((it) => {
     const d = normText(it.description);
-    if (!kws.some((k) => d.includes(k))) return false;
-    if (!ratingRe.test(d)) return false; // exact rating only — never substitute
-    return quals.every((q) => d.includes(q));
+    return kws.some((k) => d.includes(k)) && fq.every((q) => d.includes(q));
   });
 }
 
@@ -138,7 +148,10 @@ export function matchGroup(g: ComponentGroup, ctx: MatchContext, position: numbe
     if (options.length > 1) {
       base.flags.push("conflict");
       base.alternatives = options;
-      notes.push(`${options.length} conflicting price rows — preselected the row with a Terex P/N; please confirm`);
+      notes.push(
+        `${options.length} conflicting price rows — used the row with a Terex P/N. Alternatives:\n` +
+          options.map((o) => `• ${o.terexPn ?? "(no Terex P/N)"} ${o.mpn ?? ""} list ${o.listPrice ?? "-"} disc ${o.disc != null ? Math.round(o.disc * 1000) / 10 + "%" : "-"} (row ${o.rowNumber})`).join("\n"),
+      );
     }
     if (chosen.listPrice == null) notes.push("Price row has no list price");
   }

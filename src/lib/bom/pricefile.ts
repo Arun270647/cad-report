@@ -1,6 +1,6 @@
 import ExcelJS from "exceljs";
-import type { PriceRow } from "./types";
-import { clean, normMpn } from "./normalize";
+import type { PriceRow, RuleLike } from "./types";
+import { clean, normDeviceType, normMpn } from "./normalize";
 
 const COLS: Record<keyof Omit<PriceRow, "id" | "rowNumber" | "mpnNorm">, string[]> = {
   terexPn: ["TEREXPN", "TEREXP/N", "TEREXPARTNO"],
@@ -51,10 +51,12 @@ function frac(v: unknown): number | null {
 }
 
 /** Parse a consolidated price file. Finds the header row within the first 15 rows by column names. */
-export async function parsePriceFile(buf: Buffer): Promise<{ rows: PriceRow[]; sheet: string }> {
+export async function parsePriceFile(buf: ArrayBuffer | Uint8Array): Promise<{ rows: PriceRow[]; sheet: string; rules: RuleLike[] }> {
   const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(buf as unknown as ArrayBuffer);
+  await wb.xlsx.load(buf as ArrayBuffer);
+  const rules = parseRulesSheet(wb);
   for (const ws of wb.worksheets) {
+    if (isRulesSheet(ws)) continue;
     let headerRow = 0;
     const colMap: Partial<Record<keyof typeof COLS, number>> = {};
     for (let r = 1; r <= Math.min(15, ws.rowCount); r++) {
@@ -100,7 +102,7 @@ export async function parsePriceFile(buf: Buffer): Promise<{ rows: PriceRow[]; s
         tagNo: clean(get("tagNo")),
       });
     }
-    return { rows, sheet: ws.name };
+    return { rows, sheet: ws.name, rules };
   }
   throw new Error("Could not find a header row with DESCRIPTION and MANUFACTURE P/N / LIST PRICE columns");
 }
@@ -135,4 +137,47 @@ export function findPriceIssues(rows: PriceRow[]): PriceIssue[] {
     });
   }
   return issues.sort((a, b) => Number(b.kind === "conflict") - Number(a.kind === "conflict") || a.mpn.localeCompare(b.mpn));
+}
+
+function isRulesSheet(ws: ExcelJS.Worksheet) {
+  return /RULE/i.test(ws.name);
+}
+
+/**
+ * Optional "RULES" sheet inside the price workbook: Device type | Rating | Qualifier | Manufacturer P/N.
+ * e.g. MPCB | 13-18A | | GV2ME20 ;  PILOT_LAMP | - | GREEN | XB7NV63
+ */
+export function parseRulesSheet(wb: ExcelJS.Workbook): RuleLike[] {
+  const ws = wb.worksheets.find(isRulesSheet);
+  if (!ws) return [];
+  const rules: RuleLike[] = [];
+  let header = 0;
+  const cols: Record<string, number> = {};
+  for (let r = 1; r <= Math.min(10, ws.rowCount); r++) {
+    ws.getRow(r).eachCell((cell, c) => {
+      const k = key(String(cellValue(cell.value) ?? ""));
+      if (k.startsWith("DEVICE")) cols.dt = c;
+      else if (k.startsWith("RATING")) cols.rating = c;
+      else if (k.startsWith("QUALIFIER")) cols.q = c;
+      else if (k.includes("PN") || k.includes("PARTNO") || k === "MPN") cols.mpn = c;
+    });
+    if (cols.dt && cols.mpn) {
+      header = r;
+      break;
+    }
+  }
+  if (!header) return [];
+  for (let r = header + 1; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    const dt = clean(cellValue(row.getCell(cols.dt).value));
+    const mpn = clean(cellValue(row.getCell(cols.mpn).value));
+    if (!dt || !mpn) continue;
+    rules.push({
+      deviceType: normDeviceType(dt),
+      rating: (cols.rating && clean(cellValue(row.getCell(cols.rating).value))) || "-",
+      qualifier: (cols.q && clean(cellValue(row.getCell(cols.q).value))) || null,
+      mpn: String(mpn),
+    });
+  }
+  return rules;
 }

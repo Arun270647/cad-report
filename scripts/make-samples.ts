@@ -140,6 +140,12 @@ async function makePriceFile() {
   });
   ws.getRow(1).font = { bold: true };
   ws.columns.forEach((c) => (c.width = 16));
+  // Optional matching rules travel inside the price workbook (sheet name contains "RULES").
+  const rs = wb.addWorksheet("RULES");
+  rs.addRow(["Device type", "Rating", "Qualifier", "Manufacturer P/N"]);
+  rs.getRow(1).font = { bold: true };
+  for (const r of SAMPLE_RULES) rs.addRow([r.deviceType, r.rating, r.qualifier ?? "", r.mpn]);
+  rs.columns.forEach((c) => (c.width = 20));
   await wb.xlsx.writeFile(path.join(OUT, "sample-price-file.xlsx"));
 }
 

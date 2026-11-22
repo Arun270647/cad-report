@@ -1,33 +1,9 @@
-import crypto from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { decryptSecret, encryptSecret, redactSecrets } from "@/lib/crypto";
 import { normRating, isGenericMake } from "@/lib/bom/normalize";
 import { matchGroup } from "@/lib/bom/matching";
 import { groupByMake } from "@/lib/bom/grouping";
 import { validateBom } from "@/lib/bom/validation";
 import type { BomLine, ComponentGroup, PriceRow } from "@/lib/bom/types";
-
-const key = crypto.randomBytes(32).toString("base64");
-
-describe("crypto (AES-256-GCM)", () => {
-  it("round-trips and uses a random IV", () => {
-    const a = encryptSecret("sk-ant-test-1234", key);
-    const b = encryptSecret("sk-ant-test-1234", key);
-    expect(a).not.toBe(b);
-    expect(a).not.toContain("sk-ant");
-    expect(decryptSecret(a, key)).toBe("sk-ant-test-1234");
-  });
-  it("rejects tampered ciphertext and wrong keys", () => {
-    const c = encryptSecret("secret", key);
-    const parts = c.split(":");
-    parts[3] = Buffer.from("tampered").toString("base64");
-    expect(() => decryptSecret(parts.join(":"), key)).toThrow();
-    expect(() => decryptSecret(c, crypto.randomBytes(32).toString("base64"))).toThrow();
-  });
-  it("redacts keys from log text", () => {
-    expect(redactSecrets("bad key sk-ant-api03-abcDEF_123")).toBe("bad key sk-ant-***");
-  });
-});
 
 describe("normalisation", () => {
   it("normalises ratings", () => {
@@ -106,5 +82,16 @@ describe("grouping + validation", () => {
     const l = { ...base, sourceKey: "k", sourceCount: 2, qty: 3 };
     expect(validateBom([l], { totalDevices: 2 }).ok).toBe(false);
     expect(validateBom([l], { totalDevices: 2 }, { acknowledgeQuantityMismatch: true }).ok).toBe(true);
+  });
+});
+
+describe("matching: ratingless devices", () => {
+  it("matches lamps by colour + keyword without a rule", () => {
+    const items = [
+      row({ description: "PILOT LAMP GREEN 24V", mpn: "G1", mpnNorm: "G1" }),
+      row({ rowNumber: 3, description: "PILOT LAMP RED 24V", mpn: "R1", mpnNorm: "R1" }),
+    ];
+    const line = matchGroup(g({ deviceType: "PILOT_LAMP", rating: "", ratingNorm: "", colour: "RED" }), { rules: [], items, margin: 0.125 }, 1);
+    expect(line.mpn).toBe("R1");
   });
 });

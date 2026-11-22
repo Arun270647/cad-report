@@ -10,7 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import ExcelJS from "exceljs";
-import { extractPageTexts, isReservedText, renderPage } from "@/lib/pdf";
+import { extractPageTexts, isReservedText } from "./helpers/pdf-node";
 import { aggregate } from "@/lib/bom/aggregate";
 import { matchAll } from "@/lib/bom/matching";
 import { parsePriceFile, findPriceIssues } from "@/lib/bom/pricefile";
@@ -22,7 +22,7 @@ const root = path.resolve(__dirname, "..");
 const pdf = fs.readFileSync(path.join(root, "samples/sample-drawing.pdf"));
 const priceXlsx = fs.readFileSync(path.join(root, "samples/sample-price-file.xlsx"));
 const template = fs.readFileSync(path.join(root, "samples/sample-template.xlsx"));
-const rules = JSON.parse(fs.readFileSync(path.join(root, "samples/sample-rules.json"), "utf8")) as RuleLike[];
+const rulesJson = JSON.parse(fs.readFileSync(path.join(root, "samples/sample-rules.json"), "utf8")) as RuleLike[];
 const fixture = JSON.parse(fs.readFileSync(path.join(root, "tests/fixtures/sample-extraction.json"), "utf8")) as Record<string, PageExtraction>;
 
 /** Tiny evaluator for the formulas we emit (cell refs, + - * /, parentheses, SUM(range), IF(x=0,0,y)). */
@@ -58,11 +58,6 @@ describe("end-to-end: sample drawing → priced BOM export", () => {
     const skipped = texts.filter(isReservedText).map((t) => t.page);
     expect(skipped).toEqual([3]);
 
-    // 2) Rendering works server-side (pdf.js + @napi-rs/canvas)
-    const img = await renderPage(pdf, 1, 1200);
-    expect(img.png.subarray(1, 4).toString()).toBe("PNG");
-    expect(img.inkRatio).toBeGreaterThan(0.002);
-
     // 3) Extraction results (fixture replays what the Claude API returns per sheet)
     const pages: PageRecord[] = texts.map((t) =>
       skipped.includes(t.page)
@@ -81,8 +76,9 @@ describe("end-to-end: sample drawing → priced BOM export", () => {
     expect(anomalies.find((a) => a.type === "protection_below_flc")!.tags).toEqual(["Q3"]);
 
     // 5) Price file parsing + duplicate/conflict detection
-    const { rows } = await parsePriceFile(priceXlsx);
+    const { rows, rules } = await parsePriceFile(priceXlsx);
     expect(rows).toHaveLength(21);
+    expect(rules).toHaveLength(rulesJson.length); // RULES sheet inside the price workbook
     const issues = findPriceIssues(rows);
     expect(issues.find((i) => i.mpn === "GV2ME20")?.kind).toBe("conflict");
     expect(issues.find((i) => i.mpn === "XB7NV63")?.kind).toBe("duplicate");

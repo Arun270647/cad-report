@@ -1,9 +1,24 @@
 import "server-only";
-import type Anthropic from "@anthropic-ai/sdk";
+import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
-import { callClaude, ClaudeCallError } from "./claude";
-import { modelInfo } from "./settings";
-import { DEVICE_TYPES, type PageExtraction } from "./bom/types";
+import { DEVICE_TYPES, type PageExtraction } from "../bom/types";
+
+/** Models that support server-side refusal fallbacks (beta). */
+const FALLBACK_MODELS = new Set(["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-fable-5-2"]);
+
+export const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5-5";
+
+export type ErrorType = "auth" | "rate_limit" | "timeout" | "overloaded" | "refusal" | "invalid_output" | "not_configured" | "other";
+
+export class ExtractError extends Error {
+  constructor(public errorType: ErrorType, message: string, public retryable = false) {
+    super(message);
+  }
+}
+
+export function redactSecrets(text: string): string {
+  return text.replace(/sk-ant-[A-Za-z0-9_\-]+/g, "sk-ant-***");
+}
 
 const nullableString = { anyOf: [{ type: "string" }, { type: "null" }] };
 const nullableNumber = { anyOf: [{ type: "number" }, { type: "null" }] };
@@ -73,28 +88,12 @@ const PageZod = z.object({
   sheet_status: z.enum(["content", "blank", "reserved"]),
   components: z.array(
     z.object({
-      tag: ns,
-      device_type: z.string(),
-      description: ns,
-      rating: ns,
-      setting: ns,
-      coil_voltage: ns,
-      poles: ns,
-      contact_config: ns,
-      colour: ns,
-      function: ns,
-      relay_type: ns,
-      quantity: z.number().int(),
-      sheets: z.array(z.string()),
-      make: ns,
-      manufacturer_pn: ns,
-      motor_flc_a: z.number().nullable(),
-      motor_kw: z.number().nullable(),
+      tag: ns, device_type: z.string(), description: ns, rating: ns, setting: ns, coil_voltage: ns, poles: ns,
+      contact_config: ns, colour: ns, function: ns, relay_type: ns, quantity: z.number().int(), sheets: z.array(z.string()),
+      make: ns, manufacturer_pn: ns, motor_flc_a: z.number().nullable(), motor_kw: z.number().nullable(),
     }),
   ),
-  terminal_blocks: z.array(
-    z.object({ tag: z.string(), terminal_type: ns, rating: ns, terminals: z.array(z.string()), count: z.number().int() }),
-  ),
+  terminal_blocks: z.array(z.object({ tag: z.string(), terminal_type: ns, rating: ns, terminals: z.array(z.string()), count: z.number().int() })),
   notes: z.array(z.string()),
 });
 
@@ -117,53 +116,76 @@ Return strict JSON matching the schema. Rules:
 - notes: anything ambiguous or illegible that an estimator should check.
 Never invent devices. If unreadable, return what you can and explain in notes.`;
 
-export interface ExtractInput {
-  page: number;
-  png?: Buffer;
-  pdf?: Buffer;
-  userId: string;
-  jobId: string;
+function classify(err: unknown): ExtractError {
+  const msg = redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 300);
+  if (err instanceof ExtractError) return err;
+  if (err instanceof Anthropic.APIConnectionTimeoutError) return new ExtractError("timeout", msg, true);
+  if (err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError) return new ExtractError("auth", msg);
+  if (err instanceof Anthropic.RateLimitError) return new ExtractError("rate_limit", msg, true);
+  if (err instanceof Anthropic.APIConnectionError) return new ExtractError("timeout", msg, true);
+  if (err instanceof Anthropic.APIError) {
+    const body = (err.error ?? {}) as { error?: { type?: string } };
+    if (err.status === 529 || body?.error?.type === "overloaded_error") return new ExtractError("overloaded", msg, true);
+    if (err.status && err.status >= 500) return new ExtractError("other", msg, true);
+  }
+  return new ExtractError("other", msg);
 }
 
-export async function extractPage(input: ExtractInput) {
-  const content: Anthropic.Beta.BetaContentBlockParam[] = [];
-  if (input.png) {
-    content.push({ type: "image", source: { type: "base64", media_type: "image/png", data: input.png.toString("base64") } });
-  } else if (input.pdf) {
-    content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: input.pdf.toString("base64") } });
-  } else throw new Error("No page content");
-  content.push({ type: "text", text: `This is page ${input.page} of the drawing set. Extract the components as JSON.` });
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-  return callClaude<PageExtraction>({ kind: "extract", userId: input.userId, jobId: input.jobId }, async (client, model) => {
-    const info = modelInfo(model);
-    const stream = client.beta.messages.stream({
-      model,
-      max_tokens: 32000,
-      ...(info.fallbacks ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" as const } : {}),
-      system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
-      output_config: { effort: "medium", format: { type: "json_schema", schema: PAGE_SCHEMA as unknown as Record<string, unknown> } },
-      messages: [{ role: "user", content }],
-    });
-    const msg = await stream.finalMessage();
-    if (msg.stop_reason === "refusal") {
-      const e = new ClaudeCallError("refusal", "Model declined to process this sheet");
-      Object.assign(e, { usage: msg.usage });
-      throw e;
-    }
-    if (msg.stop_reason === "max_tokens") {
-      const e = new ClaudeCallError("invalid_output", "Output truncated (max_tokens)");
-      Object.assign(e, { usage: msg.usage });
-      throw e;
-    }
-    const text = msg.content.map((b) => (b.type === "text" ? b.text : "")).join("");
-    let parsed: PageExtraction;
+/**
+ * Send one rendered sheet to Claude and return validated JSON.
+ * Retries with exponential backoff on rate-limit / overload / timeout.
+ */
+export async function extractSheet(image: { data: string; mediaType: "image/png" | "image/jpeg" }, page: number) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new ExtractError("not_configured", "ANTHROPIC_API_KEY is not set in the Vercel project");
+  const client = new Anthropic({ apiKey, maxRetries: 0, timeout: 200_000 });
+  const deadline = Date.now() + 270_000;
+  let last: ExtractError | null = null;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const t0 = Date.now();
     try {
-      parsed = PageZod.parse(JSON.parse(text)) as PageExtraction;
-    } catch {
-      const e = new ClaudeCallError("invalid_output", "Extraction did not match the JSON schema");
-      Object.assign(e, { usage: msg.usage });
-      throw e;
+      const stream = client.beta.messages.stream({
+        model: MODEL,
+        max_tokens: 32000,
+        ...(FALLBACK_MODELS.has(MODEL) ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" as const } : {}),
+        system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+        output_config: { effort: "medium", format: { type: "json_schema", schema: PAGE_SCHEMA as unknown as Record<string, unknown> } },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: image.mediaType, data: image.data } },
+              { type: "text", text: `This is page ${page} of the drawing set. Extract the components as JSON.` },
+            ],
+          },
+        ],
+      });
+      const msg = await stream.finalMessage();
+      if (msg.stop_reason === "refusal") throw new ExtractError("refusal", "The model declined to process this sheet");
+      if (msg.stop_reason === "max_tokens") throw new ExtractError("invalid_output", "Output truncated", true);
+      const text = msg.content.map((b) => (b.type === "text" ? b.text : "")).join("");
+      let parsed: PageExtraction;
+      try {
+        parsed = PageZod.parse(JSON.parse(text)) as PageExtraction;
+      } catch {
+        throw new ExtractError("invalid_output", "Extraction did not match the JSON schema", true);
+      }
+      return {
+        result: parsed,
+        model: msg.model,
+        latencyMs: Date.now() - t0,
+        usage: { input: (msg.usage.input_tokens ?? 0) + (msg.usage.cache_read_input_tokens ?? 0) + (msg.usage.cache_creation_input_tokens ?? 0), output: msg.usage.output_tokens ?? 0 },
+      };
+    } catch (e) {
+      last = classify(e);
+      console.warn(`[extract] page ${page} attempt ${attempt} failed: ${last.errorType}`);
+      if (!last.retryable || attempt === 4) break;
+      const backoff = Math.min(30_000, 2000 * 2 ** (attempt - 1)) + Math.random() * 500;
+      if (Date.now() + backoff + 30_000 > deadline) break;
+      await sleep(backoff);
     }
-    return { value: parsed, usage: msg.usage, model: msg.model };
-  });
+  }
+  throw last ?? new ExtractError("other", "Extraction failed");
 }
