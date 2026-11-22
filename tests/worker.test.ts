@@ -50,6 +50,12 @@ describe("worker against a fake server + fake claude", () => {
   let posted: Posted[] = [];
   let nextHeaders: http.IncomingHttpHeaders[] = [];
   let workDir = "";
+  let catalogFetches = 0;
+  const CATALOG = {
+    version: "a".repeat(64),
+    count: 2,
+    text: "id | description | manufacturer P/N | make\n31 | MOTOR PROTECTION CIRCUIT BREAKER, 13-18A | GV2ME20 | SCHNEIDER\n40 | TERMINAL 2.5 SQMM | UT2.5 | PHOENIX",
+  };
   const saved: Record<string, string | undefined> = {};
 
   beforeAll(async () => {
@@ -63,6 +69,11 @@ describe("worker against a fake server + fake claude", () => {
         const t = queue.shift();
         if (!t) res.writeHead(204).end();
         else res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(t));
+        return;
+      }
+      if (req.method === "GET" && req.url === "/api/worker/catalog") {
+        catalogFetches++;
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(CATALOG));
         return;
       }
       if (req.method === "POST" && req.url === "/api/worker/result") {
@@ -181,6 +192,32 @@ describe("worker against a fake server + fake claude", () => {
     } finally {
       delete process.env.FAKE_CLAUDE_RESET;
     }
+  });
+
+  it("sends the price-list catalog with the image (fetched once per version) and tags the result with its version", async () => {
+    process.env.FAKE_CLAUDE_MODE = "ok";
+    const c = cfg();
+    const prep = await prepare(c);
+    const state = { wakers: new Set() };
+    const task = (page: number) => ({ jobId: "11111111-2222-3333-4444-555555555555", page, attempt: 1, mediaType: "image/png", data: IMAGE, catalogVersion: CATALOG.version });
+    posted = [];
+    catalogFetches = 0;
+    queue = [task(3), task(4)];
+    await runOnce(c, prep, state);
+    await runOnce(c, prep, state);
+    expect(catalogFetches).toBe(1);
+    expect(posted).toHaveLength(2);
+    const body = posted[0];
+    expect(body.ok).toBe(true);
+    expect(body.result.catalog_version).toBe(CATALOG.version);
+    expect(body.result.components[0].catalog_id).toBe(31);
+    expect(body.result.notes).toEqual(expect.arrayContaining(["catalog-parts=2", "stdin-ok=true", "argv-has-image=false"]));
+  });
+
+  it("without a catalog version no catalog is sent and catalog_version is null", async () => {
+    const { body } = await runWith("ok");
+    expect(body.result.catalog_version).toBeNull();
+    expect(body.result.notes).toContain("catalog-parts=0");
   });
 
   it("slow → killed at the timeout, ok:false retryable", async () => {

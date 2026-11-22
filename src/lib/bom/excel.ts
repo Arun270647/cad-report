@@ -1,6 +1,7 @@
 import ExcelJS from "exceljs";
 import type { BomLine } from "./types";
 import { groupByMake, type GroupedBom } from "./grouping";
+import { displayMake } from "./normalize";
 
 export const TEMPLATE_HEADERS = [
   "TEREX P/N",
@@ -68,11 +69,19 @@ export async function buildWorkbook(
   const grouped = groupByMake(lines);
   const wb = new ExcelJS.Workbook();
   let ws: ExcelJS.Worksheet;
+  let headerRow = 1;
   if (opts.template) {
     await wb.xlsx.load(opts.template as unknown as ArrayBuffer);
     ws = wb.worksheets[0] ?? wb.addWorksheet("BOM");
-    // keep the template's header row (row 1) and column widths; clear everything below it
-    if (ws.rowCount > 1) ws.spliceRows(2, ws.rowCount - 1);
+    // The template's header row is the first row (within 10) whose column A says TEREX P/N; keep it, the rows above
+    // it and the column widths; clear everything below it.
+    for (let r = 1; r <= Math.min(10, ws.rowCount); r++) {
+      if (/TEREX\s*P\s*\/?\s*N/i.test(String(ws.getRow(r).getCell(1).value ?? ""))) {
+        headerRow = r;
+        break;
+      }
+    }
+    if (ws.rowCount > headerRow) ws.spliceRows(headerRow + 1, ws.rowCount - headerRow);
   } else {
     ws = wb.addWorksheet("BOM");
   }
@@ -85,9 +94,12 @@ export async function buildWorkbook(
     if (!opts.template || !col.width) col.width = w;
   });
 
-  // Header row (row 1): always enforce the A–N headers, yellow fill, bold.
-  const header = ws.getRow(1);
-  TEMPLATE_HEADERS.forEach((h, i) => (header.getCell(i + 1).value = h));
+  // Header row: the A–N headers (the template's own wording is kept when present), yellow fill, bold.
+  const header = ws.getRow(headerRow);
+  TEMPLATE_HEADERS.forEach((h, i) => {
+    const cell = header.getCell(i + 1);
+    if (!String(cell.value ?? "").trim()) cell.value = h;
+  });
   header.eachCell((c) => {
     c.font = { ...FONT, bold: true };
     c.fill = YELLOW;
@@ -95,10 +107,10 @@ export async function buildWorkbook(
     c.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
   });
   header.height = 28;
-  ws.views = [{ state: "frozen", ySplit: 1 }];
+  ws.views = [{ state: "frozen", ySplit: headerRow }];
 
   const layout: ExportLayout = {
-    headerRow: 1,
+    headerRow,
     makeHeaderRows: {},
     itemRows: {},
     subtotalRows: {},
@@ -107,7 +119,7 @@ export async function buildWorkbook(
     summaryRows: {},
   };
 
-  let r = 2;
+  let r = headerRow + 1;
   for (const g of grouped.groups) {
     // make header row
     const mh = ws.getRow(r);
@@ -128,7 +140,7 @@ export async function buildWorkbook(
       row.getCell(3).value = l.drgSheetNo ?? null;
       row.getCell(4).value = l.description ?? null;
       row.getCell(5).value = l.mpn ?? null;
-      row.getCell(6).value = l.make ?? null;
+      row.getCell(6).value = l.make ? displayMake(l.make) : null;
       row.getCell(7).value = l.uom ?? null;
       row.getCell(8).value = l.qty;
       row.getCell(9).value = l.listPrice ?? null;

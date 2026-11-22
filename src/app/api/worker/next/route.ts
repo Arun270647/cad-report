@@ -3,6 +3,7 @@ import type { WorkerTask } from "@/lib/contract";
 import { sql } from "@/lib/server/db";
 import { handle, json, NO_STORE } from "@/lib/server/http";
 import { MAX_ATTEMPTS, refreshJobStatus } from "@/lib/server/jobs";
+import { priceListVersion } from "@/lib/server/reference";
 import { requireWorker } from "@/lib/server/worker-auth";
 
 export const runtime = "nodejs";
@@ -100,5 +101,7 @@ export const GET = handle(async (req: Request) => {
     return t;
   });
 
-  return task ? json(task) : idle();
+  if (!task) return idle();
+  task.catalogVersion = await priceListVersion(db);
+  return json(task);
 });

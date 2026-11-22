@@ -12,11 +12,11 @@ export function splitCommand(str: string): string[];
 export function resolveClaude(claudeBin: string): Prepared["claude"];
 export function sanitizedEnv(base?: Record<string, string | undefined>): Record<string, string>;
 export function buildClaudeArgs(model?: string): string[];
-export function buildStdinMessage(task: { page: number; mediaType: string; data: string }): string;
+export function buildStdinMessage(task: { page: number; mediaType: string; data: string }, catalog?: { version: string; count: number; text: string } | null): string;
 export function looksLikePage(v: unknown): boolean;
 export function interpretOutput(o: Record<string, any>, timeoutMs: number): any;
 export function validateTask(t: unknown): string | null;
-export function extractPage(task: any, cfg: WorkerConfig, claude: Prepared["claude"]): Promise<any>;
+export function extractPage(task: any, cfg: WorkerConfig, claude: Prepared["claude"], catalog?: { version: string; count: number; text: string } | null): Promise<any>;
 export function prepare(cfg: WorkerConfig): Promise<Prepared>;
 export function runOnce(cfg: WorkerConfig, prep?: Prepared, state?: any): Promise<{
   status: "idle" | "processed" | "http_error" | "invalid_task"; backoffMs?: number | null; posted?: number | null; body?: any; outcome?: any; httpStatus?: number;

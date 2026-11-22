@@ -1,6 +1,6 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Alert, Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Table, Td, Th } from "@/components/ui";
+import { Alert, Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Table, Td, Th } from "@/components/ui";
 import { LineChip, SheetBadge } from "@/components/job-status";
 import { StatusPill } from "@/components/status-pill";
 import { cn, fmtMoney, fmtPct } from "@/lib/utils";
@@ -16,16 +16,35 @@ import {
 } from "@/lib/client/convert";
 import { parsePriceFile } from "@/lib/bom/pricefile";
 import { aggregate } from "@/lib/bom/aggregate";
+import { canonicalizeCatalogIds } from "@/lib/bom/catalog";
 import { matchAll } from "@/lib/bom/matching";
 import { buildWorkbook } from "@/lib/bom/excel";
 import { type GroupedBom } from "@/lib/bom/grouping";
 import { validateBom, type ValidationResult } from "@/lib/bom/validation";
 import type { Anomaly, BomLine, DeviceCounts, PageRecord } from "@/lib/bom/types";
-import type { StatusView } from "@/lib/contract";
+import type { ReferenceView, StatusView } from "@/lib/contract";
 
-const LS_PRICE = "pbp.priceFile";
-const LS_MARGIN = "pbp.margin";
 const STATUS_POLL_MS = 15000;
+
+/** Download the preloaded reference file (signed-in only; never stored in this browser). */
+async function fetchReferenceFile(kind: "price_list" | "template"): Promise<ArrayBuffer> {
+  const res = await fetch(`/api/reference/${kind}`, { credentials: "same-origin", cache: "no-store" });
+  if (res.status === 401) throw new AuthError();
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(body?.error ?? `Could not load the ${kind.replace("_", " ")} (${res.status})`);
+  }
+  return res.arrayBuffer();
+}
+
+function triggerDownload(url: string, filename: string) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
 
 type Phase = "idle" | "preparing" | "uploading" | "waiting" | "matching" | "done";
 
@@ -39,80 +58,65 @@ interface Result {
   filename: string;
 }
 
-const store = {
-  get(k: string) {
-    try {
-      return localStorage.getItem(k);
-    } catch {
-      return null;
-    }
-  },
-  set(k: string, v: string) {
-    try {
-      localStorage.setItem(k, v);
-      return true;
-    } catch {
-      return false;
-    }
-  },
-};
-
-function b64ToBuf(b64: string): ArrayBuffer {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out.buffer;
-}
-function bufToB64(buf: ArrayBuffer): string {
-  const bytes = new Uint8Array(buf);
-  let s = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return btoa(s);
-}
-
 export default function Home() {
   const [pdf, setPdf] = useState<File | null>(null);
-  const [price, setPrice] = useState<{ name: string; data: ArrayBuffer } | null>(null);
-  const [margin, setMargin] = useState("12.5");
+  const [reference, setReference] = useState<ReferenceView | null>(null);
   const [progress, setProgress] = useState<ConversionProgress | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<Result | null>(null);
-  const [held, setHeld] = useState<{ records: PageRecord[]; filename: string } | null>(null); // finished job waiting for a price list
   const [email, setEmail] = useState<string | null>(null);
   const [workerOnline, setWorkerOnline] = useState<boolean | null>(null);
   const [status, setStatus] = useState<StatusView | null>(null);
   const [resumed, setResumed] = useState(false);
   const pdfInput = useRef<HTMLInputElement>(null);
-  const priceInput = useRef<HTMLInputElement>(null);
   const runRef = useRef<AbortController | null>(null);
   const progressName = useRef("");
-  const priceRef = useRef(price);
-  const marginRef = useRef(margin);
-  priceRef.current = price;
-  marginRef.current = margin;
 
-  /* Build the BOM + Excel locally (price list never leaves the browser). */
+  /**
+   * Build the BOM + Excel from Claude's result and the PRELOADED price list + template (no review step):
+   * each line is priced from exactly the catalog row Claude chose; the report downloads automatically.
+   */
   const finish = useCallback(async (records: PageRecord[], drawingName: string) => {
-    const pf = priceRef.current;
-    if (!pf) {
-      setHeld({ records, filename: drawingName });
-      setPhase("idle");
-      return;
-    }
-    setHeld(null);
     setPhase("matching");
     try {
-      const marginFrac = Math.max(0, Number(marginRef.current) || 0) / 100;
-      store.set(LS_MARGIN, marginRef.current);
-      const { rows, rules } = await parsePriceFile(pf.data.slice(0));
-      const { groups, counts, anomalies } = aggregate(records);
+      const ref = await apiRequest<ReferenceView>("/api/reference");
+      if (!ref?.priceList) throw new Error("No price list has been loaded yet — ask an admin to upload it on the Worker page.");
+      const [priceBuf, templateBuf] = await Promise.all([
+        fetchReferenceFile("price_list"),
+        ref.template ? fetchReferenceFile("template") : Promise.resolve(null),
+      ]);
+      const { rows } = await parsePriceFile(priceBuf);
+      const version = ref.priceList.sha256;
+      // A sheet read against an older price list: its catalog ids may point at other parts now — never use them.
+      const stale = records.filter((p) => p.result && p.result.catalog_version && p.result.catalog_version !== version).map((p) => p.page);
+      const usable = records.map((p) =>
+        stale.includes(p.page) && p.result
+          ? {
+              ...p,
+              result: {
+                ...p.result,
+                components: p.result.components.map((c) => ({ ...c, catalog_id: null })),
+                terminal_blocks: p.result.terminal_blocks.map((t) => ({ ...t, catalog_id: null })),
+              },
+            }
+          : p,
+      );
+      const { groups, counts, anomalies } = aggregate(canonicalizeCatalogIds(usable, rows));
       for (const p of records.filter((x) => x.status === "error")) {
         anomalies.push({ type: "unreadable_sheet", message: `Page ${p.page}: ${p.error}`, tags: [], sheets: [String(p.page)] });
       }
-      const lines = matchAll(groups, { rules, items: rows, margin: marginFrac });
+      if (stale.length) {
+        anomalies.push({
+          type: "unreadable_sheet",
+          message: `The price list was replaced after sheet(s) ${stale.join(", ")} were read — their lines are left unpriced. Convert the drawing again to price them.`,
+          tags: [],
+          sheets: stale.map(String),
+        });
+      }
+      const lines = matchAll(groups, { rules: [], items: rows, margin: ref.margin, catalogMode: true });
       const title = drawingName || "Drawing";
-      const { buffer, grouped } = await buildWorkbook(lines, { title });
+      const { buffer, grouped } = await buildWorkbook(lines, { title, template: templateBuf });
       const url = URL.createObjectURL(new Blob([buffer as BlobPart], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
       const filename = title.replace(/\.pdf$/i, "") + "_BOM.xlsx";
       setResult((old) => {
@@ -120,7 +124,9 @@ export default function Home() {
         return { lines, grouped, counts, anomalies, validation: validateBom(lines, counts), url, filename };
       });
       setPhase("done");
+      triggerDownload(url, filename);
     } catch (e) {
+      if (e instanceof AuthError) return;
       setError((e as Error).message);
       setPhase("idle");
     }
@@ -134,7 +140,6 @@ export default function Home() {
       runRef.current = ctrl;
       setError(null);
       setResult(null);
-      setHeld(null);
       setPhase("preparing");
       try {
         const records = await work(ctrl.signal);
@@ -154,23 +159,13 @@ export default function Home() {
     if (p.phase !== "done") setPhase(p.phase);
   }, []);
 
-  /* Restore remembered price list + margin; resume a running job. */
+  /* Forget the price list older versions kept in this browser; resume a running job. */
   useEffect(() => {
-    const saved = store.get(LS_PRICE);
-    if (saved) {
-      try {
-        const { name, b64 } = JSON.parse(saved) as { name: string; b64: string };
-        const p = { name, data: b64ToBuf(b64) };
-        priceRef.current = p;
-        setPrice(p);
-      } catch {
-        /* ignore */
-      }
-    }
-    const m = store.get(LS_MARGIN);
-    if (m) {
-      marginRef.current = m;
-      setMargin(m);
+    try {
+      localStorage.removeItem("pbp.priceFile");
+      localStorage.removeItem("pbp.margin");
+    } catch {
+      /* storage disabled */
     }
     const active = getActiveJob();
     if (active) {
@@ -213,10 +208,14 @@ export default function Home() {
     };
   }, []);
 
-  /* A finished job was waiting for the price list. */
+  /* Which preloaded price list / template / margin will be used (shown under the drop zone). */
   useEffect(() => {
-    if (held && price) void finish(held.records, held.filename);
-  }, [held, price, finish]);
+    const ctrl = new AbortController();
+    apiRequest<ReferenceView>("/api/reference", { signal: ctrl.signal })
+      .then((r) => setReference(r ?? null))
+      .catch(() => undefined);
+    return () => ctrl.abort();
+  }, []);
 
   async function signOut() {
     runRef.current?.abort();
@@ -228,21 +227,6 @@ export default function Home() {
     window.location.replace("/login");
   }
 
-  async function pickPrice(f: File | undefined) {
-    if (!f) return;
-    if (!f.name.toLowerCase().endsWith(".xlsx")) return setError("The price list must be an .xlsx file.");
-    const data = await f.arrayBuffer();
-    try {
-      await parsePriceFile(data.slice(0));
-    } catch (e) {
-      return setError(`Price list: ${(e as Error).message}`);
-    }
-    setError(null);
-    setPrice({ name: f.name, data });
-    if (!store.set(LS_PRICE, JSON.stringify({ name: f.name, b64: bufToB64(data) }))) {
-      setError("The price list is loaded, but this browser could not remember it (storage full or disabled).");
-    }
-  }
   function pickPdf(f: File | undefined) {
     if (!f) return;
     if (!f.name.toLowerCase().endsWith(".pdf")) return setError("The drawing must be a PDF file.");
@@ -255,12 +239,11 @@ export default function Home() {
   }
 
   function convert() {
-    if (!pdf || !price) return;
+    if (!pdf) return;
     const file = pdf;
     setResumed(false);
     setProgress(null);
     progressName.current = file.name;
-    store.set(LS_MARGIN, margin);
     void start(async (signal) => runConversion(await file.arrayBuffer(), file.name, onProgress, signal), file.name);
   }
 
@@ -315,34 +298,25 @@ export default function Home() {
           <StatusPill status={status} />
         </header>
 
-        <div className="grid gap-4 md:grid-cols-3">
-          <DropZone
-            className="md:col-span-2"
-            title={pdf ? pdf.name : resumed && progress?.filename ? progress.filename : "Drop the drawing PDF here"}
-            subtitle={pdf ? `${(pdf.size / 1024 / 1024).toFixed(2)} MB — click to change` : resumed && busy ? "Resumed after reload — still processing" : "or click to choose a PDF"}
-            active={!!pdf || (resumed && busy)}
-            onFile={(f) => !busy && pickPdf(f)}
-            onClick={() => !busy && pdfInput.current?.click()}
-          >
-            <input ref={pdfInput} type="file" accept="application/pdf,.pdf" className="hidden" onChange={(e) => pickPdf(e.target.files?.[0])} />
-          </DropZone>
-          <DropZone
-            title={price ? price.name : "Drop your price list (.xlsx)"}
-            subtitle={price ? "Remembered in this browser — click to replace" : "Needed once; remembered afterwards. It never leaves this browser."}
-            active={!!price}
-            onFile={pickPrice}
-            onClick={() => priceInput.current?.click()}
-          >
-            <input ref={priceInput} type="file" accept=".xlsx" className="hidden" onChange={(e) => pickPrice(e.target.files?.[0])} />
-          </DropZone>
-        </div>
+        <DropZone
+          title={pdf ? pdf.name : resumed && progress?.filename ? progress.filename : "Drop the drawing PDF here"}
+          subtitle={pdf ? `${(pdf.size / 1024 / 1024).toFixed(2)} MB — click to change` : resumed && busy ? "Resumed after reload — still processing" : "or click to choose a PDF"}
+          active={!!pdf || (resumed && busy)}
+          onFile={(f) => !busy && pickPdf(f)}
+          onClick={() => !busy && pdfInput.current?.click()}
+        >
+          <input ref={pdfInput} type="file" accept="application/pdf,.pdf" className="hidden" onChange={(e) => pickPdf(e.target.files?.[0])} />
+        </DropZone>
+        <p className="-mt-3 text-xs text-muted-foreground">
+          {reference?.priceList
+            ? `Priced from the preloaded price list (${reference.priceList.parts} parts${reference.template ? ", company template" : ""}, margin ${Math.round(reference.margin * 1000) / 10}%). The Excel file downloads automatically when the drawing has been read.`
+            : reference
+              ? "No price list has been loaded yet — an admin can upload it on the Worker page."
+              : ""}
+        </p>
 
         <div className="flex flex-wrap items-end gap-3 sm:gap-4">
-          <div className="space-y-1">
-            <Label htmlFor="margin">Margin %</Label>
-            <Input id="margin" type="number" step="0.1" min="0" className="w-28" value={margin} onChange={(e) => setMargin(e.target.value)} />
-          </div>
-          <Button size="lg" onClick={convert} disabled={!pdf || !price || busy}>
+          <Button size="lg" onClick={convert} disabled={!pdf || busy || reference?.priceList === null}>
             {buttonLabel}
           </Button>
           {result && (
@@ -360,11 +334,6 @@ export default function Home() {
         </div>
 
         {error && <Alert variant="danger">{error}</Alert>}
-        {held && !price && (
-          <Alert variant="warning">
-            All sheets of {held.filename || "the drawing"} have been read. Drop your price list above to build the Excel file.
-          </Alert>
-        )}
 
         {progress && (pages.length > 0 || busy) && (
           <Card>

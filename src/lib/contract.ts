@@ -53,6 +53,20 @@ export interface WorkerTask {
   attempt: number;
   mediaType: "image/png" | "image/jpeg";
   data: string; // base64
+  /** sha256 of the active price list; the worker fetches GET /api/worker/catalog when it changes. null = none. */
+  catalogVersion?: string | null;
+}
+/** GET /api/worker/catalog → the price-list catalog Claude chooses catalog_id values from. */
+export interface WorkerCatalog { version: string; count: number; text: string }
+
+/* Reference data (preloaded; stored in the database, never in Git) */
+export type ReferenceKind = "price_list" | "template";
+export interface ReferenceMeta { filename: string; sha256: string; size: number; uploadedBy: string | null; uploadedAt: string }
+/** GET /api/reference (signed-in) — file bytes come from GET /api/reference/:kind. */
+export interface ReferenceView {
+  priceList: (ReferenceMeta & { parts: number }) | null;
+  template: ReferenceMeta | null;
+  margin: number; // fraction, e.g. 0.125
 }
 export type WorkerFailureKind = "usage_limit" | "auth" | "limit" | "timeout" | "invalid_output" | "error";
 export type WorkerResultRequest =

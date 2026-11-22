@@ -1,5 +1,6 @@
 import type { BomLine, ComponentGroup, PriceOption, PriceRow, RuleLike } from "./types";
-import { normDeviceType, normMpn, normQualifier, normRating, normText, prettyDeviceType } from "./normalize";
+import { canonicalMake, clean, normDeviceType, normMpn, normQualifier, normRating, normText, prettyDeviceType } from "./normalize";
+import { resolveCatalogRow } from "./catalog";
 
 /** Keywords that must appear in a price-row description for the description fallback. */
 const DEVICE_KEYWORDS: Record<string, string[]> = {
@@ -24,6 +25,11 @@ export interface MatchContext {
   rules: RuleLike[];
   items: PriceRow[];
   margin: number;
+  /**
+   * Catalog mode (production): Claude has already chosen the price-list row for each line (catalogId). The row it
+   * chose is final — no rule/description fallback; null means "not in the price list" (price left blank).
+   */
+  catalogMode?: boolean;
 }
 
 function groupQualifiers(g: ComponentGroup): string[] {
@@ -91,7 +97,55 @@ export function distinctOptions(rows: PriceRow[]): PriceOption[] {
   return [...seen.values()];
 }
 
+/** Catalog mode: price the line from exactly the row Claude chose (its P/N's last occurrence in the file). */
+function matchCatalog(g: ComponentGroup, ctx: MatchContext, position: number): BomLine {
+  const notes: string[] = [...g.notes];
+  const flags: string[] = g.anomaly ? ["anomaly"] : [];
+  const line: BomLine = {
+    position,
+    terexPn: null,
+    whereUsed: g.tags.join(", ").slice(0, 500) || null,
+    drgSheetNo: g.sheets.join(", ").slice(0, 200) || null,
+    description: g.descriptionHint,
+    mpn: g.mpn,
+    make: g.make ? canonicalMake(g.make) : null,
+    uom: "NOS",
+    qty: g.qty,
+    listPrice: null,
+    disc: null,
+    margin: ctx.margin,
+    status: "matched",
+    flags,
+    alternatives: [],
+    notes: null,
+    sourceKey: g.key,
+    sourceCount: g.qty,
+  };
+  const row = g.catalogId != null ? resolveCatalogRow(g.catalogId, ctx.items) : null;
+  if (!row) {
+    flags.push("not_found");
+    notes.push(
+      g.catalogId == null
+        ? "Not in the preloaded price list — price left blank (never substituted)"
+        : `Price-list row ${g.catalogId} chosen on the PC is not in the current price list (it was replaced after reading) — price left blank`,
+    );
+  } else {
+    line.terexPn = clean(row.terexPn) && row.terexPn !== "-" ? row.terexPn : null;
+    line.mpn = clean(row.mpn) && row.mpn !== "-" ? row.mpn : (line.mpn ?? null);
+    line.make = row.make ? canonicalMake(row.make) : line.make;
+    line.description = clean(row.description) ?? line.description;
+    line.uom = clean(row.uom) ?? line.uom;
+    line.listPrice = row.listPrice;
+    line.disc = row.disc;
+    if (row.listPrice == null) notes.push(`Price-list row ${row.rowNumber} has no list price`);
+  }
+  line.status = flags.includes("not_found") ? "not_found" : flags.includes("anomaly") ? "anomaly" : "matched";
+  line.notes = notes.length ? notes.join("\n") : null;
+  return line;
+}
+
 export function matchGroup(g: ComponentGroup, ctx: MatchContext, position: number): BomLine {
+  if (ctx.catalogMode) return matchCatalog(g, ctx, position);
   let mpns = findRuleMpns(g, ctx.rules);
   let via = "rule";
   if (!mpns.length && g.mpn) {

@@ -38,9 +38,38 @@ export function isGenericMake(make: string | null | undefined): boolean {
   return m === "" || GENERIC_MAKES.test(m) || /LABOU?R|NON[\s\-]?STOCK/i.test(m);
 }
 
+/**
+ * Spelling variants seen in the consolidated price file → one canonical make, so each maker forms ONE group in the
+ * report. Keys are compared after upper-casing and removing spaces/dots.
+ */
+const MAKE_ALIASES: Record<string, string> = {
+  SCHENIDER: "SCHNEIDER",
+  SCHNIEDER: "SCHNEIDER",
+  SCHNEIDERELECTRIC: "SCHNEIDER",
+  "L&T": "L&T",
+  LANDT: "L&T",
+  LT: "L&T",
+  MENEKKES: "MENNEKES",
+  MENNEKES: "MENNEKES",
+  RITAL: "RITTAL",
+  RITTAL: "RITTAL",
+  R: "RITTAL",
+  POLYCABB: "POLYCAB",
+  PROCONCONTROLS: "PROCON",
+  PHOENIXCONTACT: "PHOENIX CONTACT",
+  PHOENIX: "PHOENIX CONTACT",
+};
+
+/** Canonical upper-case make name ("Schenider" → "SCHNEIDER", "L & T" → "L&T"); unknown makes are only upper-cased. */
+export function canonicalMake(make: string): string {
+  const up = make.trim().toUpperCase().replace(/\s+/g, " ");
+  const k = up.replace(/[\s.]/g, "");
+  return MAKE_ALIASES[k] ?? up;
+}
+
 export function displayMake(make: string | null | undefined): string {
-  const m = (make ?? "").trim().toUpperCase();
-  return m === "" ? "UNSPECIFIED" : m;
+  const m = (make ?? "").trim();
+  return m === "" ? "UNSPECIFIED" : canonicalMake(m);
 }
 
 export function prettyDeviceType(dt: string): string {

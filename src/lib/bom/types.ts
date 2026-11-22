@@ -25,6 +25,8 @@ export interface ExtractedComponent {
   manufacturer_pn: string | null;
   motor_flc_a: number | null;
   motor_kw: number | null;
+  /** Row id in the preloaded price-list catalog chosen by Claude; null = not in the catalog. Absent in old results. */
+  catalog_id?: number | null;
 }
 
 export interface TerminalBlock {
@@ -33,6 +35,8 @@ export interface TerminalBlock {
   rating: string | null;
   terminals: string[];
   count: number;
+  /** Catalog row for this strip's terminals (see ExtractedComponent.catalog_id). */
+  catalog_id?: number | null;
 }
 
 export interface PageExtraction {
@@ -42,6 +46,8 @@ export interface PageExtraction {
   components: ExtractedComponent[];
   terminal_blocks: TerminalBlock[];
   notes: string[];
+  /** Version (sha256) of the price list whose catalog Claude matched against; added by the worker. */
+  catalog_version?: string | null;
 }
 
 export interface PageRecord {
@@ -80,6 +86,8 @@ export interface ComponentGroup {
   descriptionHint: string;
   anomaly: boolean;
   notes: string[];
+  /** Catalog row chosen by Claude for every unit of this line (undefined/null = none). */
+  catalogId?: number | null;
 }
 
 export interface PriceRow {

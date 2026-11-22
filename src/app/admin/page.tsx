@@ -1,7 +1,108 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
-import type { AdminWorkerView, JobStatus, WorkerState } from "@/lib/contract";
-import { Alert, Badge, Button, Card, CardContent, CardHeader, CardTitle, Table, Td, Th } from "@/components/ui";
+import type { AdminWorkerView, JobStatus, ReferenceView, WorkerState } from "@/lib/contract";
+import { Alert, Badge, Button, Card, CardContent, CardHeader, CardTitle, Input, Table, Td, Th } from "@/components/ui";
+
+function fileToB64(f: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).replace(/^data:[^,]*,/, ""));
+    r.onerror = () => reject(r.error ?? new Error("Could not read the file"));
+    r.readAsDataURL(f);
+  });
+}
+
+/** Preloaded price list + template + margin (stored in the database, never in Git). */
+function ReferenceCard() {
+  const [ref, setRef] = useState<ReferenceView | null>(null);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [margin, setMargin] = useState("");
+
+  const load = useCallback(async () => {
+    const res = await fetch("/api/reference", { credentials: "same-origin", cache: "no-store" });
+    if (res.ok) {
+      const r = (await res.json()) as ReferenceView;
+      setRef(r);
+      setMargin(String(Math.round(r.margin * 10000) / 100));
+    }
+  }, []);
+  useEffect(() => void load(), [load]);
+
+  async function post(body: unknown, okText: (j: Record<string, unknown>) => string) {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const res = await fetch("/api/admin/reference", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!res.ok) throw new Error(String(j.error ?? `Request failed (${res.status})`));
+      setMsg({ ok: true, text: okText(j) });
+      await load();
+    } catch (e) {
+      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function upload(kind: "price_list" | "template", f: File | undefined) {
+    if (!f) return;
+    if (!f.name.toLowerCase().endsWith(".xlsx")) return setMsg({ ok: false, text: "Choose an .xlsx file." });
+    const data = await fileToB64(f);
+    await post({ kind, filename: f.name, data }, (j) => `${kind === "price_list" ? "Price list" : "Template"} replaced: ${f.name} (${String(j.summary ?? "")}).`);
+  }
+
+  const row = (label: string, kind: "price_list" | "template", m: ReferenceView["template"], extra?: string) => (
+    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border py-2 last:border-0">
+      <div className="min-w-0">
+        <p className="font-medium">{label}</p>
+        <p className="truncate text-xs text-muted-foreground" title={m?.filename ?? ""}>
+          {m ? `${m.filename}${extra ? ` · ${extra}` : ""} · ${(m.size / 1024).toFixed(0)} KB · ${m.uploadedBy ?? "loaded at setup"} · ${new Date(m.uploadedAt).toLocaleString()}` : "Not loaded"}
+        </p>
+      </div>
+      <label className={`cursor-pointer rounded-md border border-border px-3 py-1 text-sm hover:bg-muted ${busy ? "pointer-events-none opacity-50" : ""}`}>
+        Replace…
+        <input type="file" accept=".xlsx" className="hidden" onChange={(e) => void upload(kind, e.target.files?.[0])} />
+      </label>
+    </div>
+  );
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Reference data</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2 text-sm">
+        <p className="text-xs text-muted-foreground">
+          Used for every conversion; users only upload the drawing. Stored in the database (not in the public repo). Claude
+          picks the price-list row for each part; when a part number appears more than once, its last row in the file is used.
+        </p>
+        {row("Consolidated price list", "price_list", ref?.priceList ?? null, ref?.priceList ? `${ref.priceList.parts} distinct parts` : undefined)}
+        {row("Excel template", "template", ref?.template ?? null)}
+        <form
+          className="flex flex-wrap items-center gap-2 pt-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const v = Number(margin);
+            if (!Number.isFinite(v) || v < 0 || v > 100) return setMsg({ ok: false, text: "Margin must be 0–100 %." });
+            void post({ margin: v / 100 }, () => `Margin set to ${v}%.`);
+          }}
+        >
+          <span>Margin</span>
+          <Input className="w-24" type="number" step="0.1" min="0" max="100" value={margin} onChange={(e) => setMargin(e.target.value)} />
+          <span>%</span>
+          <Button size="sm" variant="outline" type="submit" disabled={busy}>Save</Button>
+        </form>
+        {msg && <Alert variant={msg.ok ? "success" : "danger"}>{msg.text}</Alert>}
+      </CardContent>
+    </Card>
+  );
+}
 
 const REFRESH_MS = 10_000;
 
@@ -163,6 +264,8 @@ export default function AdminWorkerPage() {
                 </CardContent>
               </Card>
             </div>
+
+            <ReferenceCard />
 
             {(openAlerts.length > 0 || pastAlerts.length > 0) && (
               <Card>

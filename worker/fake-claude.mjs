@@ -44,14 +44,14 @@ if (argv[0] === "auth" && argv[1] === "status") {
   process.exit(0);
 }
 
-const page = (notes) => ({
+let page = (notes) => ({
   sheet_number: "3", sheet_title: "MOTOR STARTER", sheet_status: "content",
   components: [{
     tag: "Q1", device_type: "MPCB", description: "Motor protection breaker", rating: "13-18A", setting: "16A",
     coil_voltage: null, poles: "3P", contact_config: null, colour: null, function: null, relay_type: null,
-    quantity: 1, sheets: [], make: null, manufacturer_pn: null, motor_flc_a: 15.5, motor_kw: 7.5,
+    quantity: 1, sheets: [], make: null, manufacturer_pn: null, motor_flc_a: 15.5, motor_kw: 7.5, catalog_id: null,
   }],
-  terminal_blocks: [{ tag: "X1", terminal_type: "FEED-THROUGH", rating: "2.5sqmm", terminals: ["1", "2"], count: 2 }],
+  terminal_blocks: [{ tag: "X1", terminal_type: "FEED-THROUGH", rating: "2.5sqmm", terminals: ["1", "2"], count: 2, catalog_id: null }],
   notes,
 });
 
@@ -74,9 +74,11 @@ process.stdin.on("end", async () => {
   try { msg = JSON.parse(stdin.trim()); } catch { /* reported below */ }
   const content = msg?.message?.content || [];
   const img = content.find((c) => c.type === "image");
-  const txt = content.find((c) => c.type === "text");
+  const txt = content.find((c) => c.type === "text" && /^This is page \d+ of the drawing set\./.test(c.text || ""));
+  const cat = content.find((c) => c.type === "text" && /^PRICE-LIST CATALOG/.test(c.text || ""));
+  const catIds = cat ? [...cat.text.matchAll(/^(\d+) \|/gm)].map((m) => Number(m[1])) : [];
   const data = img?.source?.data || "";
-  const stdinOk = msg?.type === "user" && !!data && /^This is page \d+ of the drawing set\./.test(txt?.text || "");
+  const stdinOk = msg?.type === "user" && !!data && !!txt;
   const at = (f) => argv.indexOf(f);
   const flagsOk =
     argv[0] === "-p" && at("--tools") >= 0 && argv[at("--tools") + 1] === "" && argv.includes("--restricted") &&
@@ -94,7 +96,13 @@ process.stdin.on("end", async () => {
     `flags-ok=${flagsOk}`,
     `cwd-empty=${cwdEmpty}`,
     `stdin-ok=${stdinOk}`,
+    `catalog-parts=${catIds.length}`,
   ];
+  // With a catalog, "match" the component to the first catalog row (lets tests check the round trip).
+  if (catIds.length) {
+    const p0 = page;
+    page = (n) => { const p = p0(n); p.components[0].catalog_id = catIds[0]; return p; };
+  }
 
   switch (mode) {
     case "garbage":

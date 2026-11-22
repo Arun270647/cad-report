@@ -16,7 +16,7 @@ import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { PAGE_JSON_SCHEMA, SYSTEM_PROMPT, userText } from "./prompt.mjs";
+import { PAGE_JSON_SCHEMA, SYSTEM_PROMPT, catalogBlock, userText } from "./prompt.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const IS_WIN = process.platform === "win32";
@@ -345,18 +345,12 @@ export function buildClaudeArgs(model) {
   return args;
 }
 
-/** The single stream-json user message written to stdin. */
-export function buildStdinMessage(task) {
-  return JSON.stringify({
-    type: "user",
-    message: {
-      role: "user",
-      content: [
-        { type: "image", source: { type: "base64", media_type: task.mediaType, data: task.data } },
-        { type: "text", text: userText(task.page) },
-      ],
-    },
-  }) + "\n";
+/** The single stream-json user message written to stdin (image, optional price-list catalog, fixed instruction). */
+export function buildStdinMessage(task, catalog = null) {
+  const content = [{ type: "image", source: { type: "base64", media_type: task.mediaType, data: task.data } }];
+  if (catalog?.text) content.push({ type: "text", text: catalogBlock(catalog.text) });
+  content.push({ type: "text", text: userText(task.page) });
+  return JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n";
 }
 
 const REQUIRED_KEYS = ["sheet_number", "sheet_title", "sheet_status", "components", "terminal_blocks", "notes"];
@@ -430,8 +424,8 @@ export function validateTask(t) {
   return null;
 }
 
-/** Run Claude Code on one task. Never throws. */
-export async function extractPage(task, cfg, claude) {
+/** Run Claude Code on one task (with the price-list catalog when given). Never throws. */
+export async function extractPage(task, cfg, claude, catalog = null) {
   const started = Date.now();
   let cwd;
   try {
@@ -440,7 +434,7 @@ export async function extractPage(task, cfg, claude) {
     let init = null;
     let result = null;
     const r = await runChild(claude, buildClaudeArgs(cfg.claudeModel), {
-      stdin: buildStdinMessage(task),
+      stdin: buildStdinMessage(task, catalog),
       cwd,
       timeoutMs: cfg.taskTimeoutMs,
       onLine: (line) => {
@@ -452,6 +446,7 @@ export async function extractPage(task, cfg, claude) {
       },
     });
     const out = interpretOutput({ init, result, ...r }, cfg.taskTimeoutMs);
+    if (out.ok) out.result = { ...out.result, catalog_version: catalog?.version ?? null };
     return { ...out, durationMs: Date.now() - started };
   } catch (e) {
     return { ok: false, retryable: true, kind: "internal", error: `worker error: ${redact(e?.message, 200)}`, durationMs: Date.now() - started };
@@ -529,6 +524,21 @@ async function postResult(cfg, info, body, state) {
 }
 
 function short(t) { return `job ${String(t.jobId).slice(0, 8)} page ${t.page}`; }
+
+/** The catalog for `version`, from the in-memory cache or GET /api/worker/catalog. Throws on failure / mismatch. */
+async function ensureCatalog(cfg, info, state, version) {
+  if (state.catalog?.version === version) return state.catalog;
+  const res = await fetch(`${cfg.workerUrl}/api/worker/catalog`, { headers: headers(cfg, info), signal: AbortSignal.timeout(30000), redirect: "error" });
+  if (res.status === 204) { await res.body?.cancel(); throw new Error("server has no price list loaded"); }
+  if (!res.ok) throw new Error(`GET /api/worker/catalog → ${res.status}`);
+  const c = await res.json();
+  if (!c || typeof c.text !== "string" || typeof c.version !== "string" || !Number.isInteger(c.count)) throw new Error("malformed catalog");
+  if (c.version !== version) throw new Error("catalog changed while fetching; will retry");
+  if (c.text.length > 2_000_000) throw new Error("catalog too large");
+  state.catalog = { version: c.version, count: c.count, text: c.text };
+  log(`price-list catalog loaded: ${c.count} parts (version ${c.version.slice(0, 12)})`);
+  return state.catalog;
+}
 
 // ───────────────────────────── main loop ─────────────────────────────
 
@@ -613,9 +623,22 @@ export async function runOnce(cfg, prep, state = { wakers: new Set() }) {
   }
 
   const kb = Math.round((task.data.length * 3) / 4 / 1024);
-  log(`→ ${short(task)} attempt ${task.attempt ?? "?"} (${task.mediaType}, ${kb} KB)`);
+  // Price-list catalog: fetched once per version (the server sends the active version with every task).
+  let catalog = null;
+  if (typeof task.catalogVersion === "string" && /^[0-9a-f]{64}$/.test(task.catalogVersion)) {
+    try {
+      catalog = await ensureCatalog(cfg, prep.info, state, task.catalogVersion);
+    } catch (e) {
+      const error = `could not load the price-list catalog: ${redact(e?.message, 160)}`;
+      warn(`✗ ${short(task)}: ${error}`);
+      state.lastError = error;
+      const posted = await postResult(cfg, prep.info, { jobId: task.jobId, page: task.page, ok: false, error, retryable: true, kind: "error" }, state);
+      return { status: "processed", outcome: { ok: false, kind: "error", error }, posted, backoffMs: 30000 };
+    }
+  }
+  log(`→ ${short(task)} attempt ${task.attempt ?? "?"} (${task.mediaType}, ${kb} KB${catalog ? `, catalog ${catalog.count} parts` : ", no catalog"})`);
   state.current = (state.current || 0) + 1;
-  const outcome = await extractPage(task, cfg, prep.claude);
+  const outcome = await extractPage(task, cfg, prep.claude, catalog);
   state.current--;
 
   let body;

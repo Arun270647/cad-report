@@ -18,6 +18,8 @@ function sheetOf(p: PageRecord): string {
  * instance ("Motor M1 starter"), and identical parts must consolidate into one line. Functions are kept as notes.
  */
 function groupKey(c: ExtractedComponent): string {
+  // Claude matched it to a price-list row: that row IS the part (one line per catalog row).
+  if (c.catalog_id != null) return `CAT|${c.catalog_id}`;
   return [
     normDeviceType(c.device_type),
     normRating(c.rating),
@@ -154,6 +156,7 @@ export function aggregate(pages: PageRecord[]): AggregateResult {
       descriptionHint: describe(c),
       anomaly: false,
       notes: [],
+      catalogId: c.catalog_id ?? null,
     };
     g.qty += u.qty;
     if (tag) g.tags.push(tag);
@@ -183,14 +186,15 @@ export function aggregate(pages: PageRecord[]): AggregateResult {
 
   // --- terminal blocks: resolve type/rating per strip tag across ALL pages (a sheet may show only "X1: 1 2 3 4"
   //     while another sheet gives X1's type and rating), then count terminals and detect numbering clashes.
-  const blockDetails = new Map<string, { types: (string | null)[]; ratings: (string | null)[] }>();
+  const blockDetails = new Map<string, { types: (string | null)[]; ratings: (string | null)[]; catalogIds: (string | null)[] }>();
   for (const p of pages) {
     if (p.status !== "done" || !p.result || p.result.sheet_status !== "content") continue;
     for (const tb of p.result.terminal_blocks ?? []) {
       const blockTag = (clean(tb.tag) ?? "X?").toUpperCase();
-      const d = blockDetails.get(blockTag) ?? { types: [], ratings: [] };
+      const d = blockDetails.get(blockTag) ?? { types: [], ratings: [], catalogIds: [] };
       d.types.push(clean(tb.terminal_type));
       d.ratings.push(clean(tb.rating));
+      d.catalogIds.push(tb.catalog_id != null ? String(tb.catalog_id) : null);
       blockDetails.set(blockTag, d);
     }
   }
@@ -207,7 +211,8 @@ export function aggregate(pages: PageRecord[]): AggregateResult {
       const rating = clean(raw.rating) ?? common(d.ratings);
       if (!terminal_type && d.types.some(Boolean)) ambiguous.push("type");
       if (!rating && d.ratings.some(Boolean)) ambiguous.push("rating");
-      const tb = { ...raw, terminal_type, rating };
+      const catId = raw.catalog_id != null ? raw.catalog_id : (() => { const c = common(d.catalogIds); return c ? Number(c) : null; })();
+      const tb = { ...raw, terminal_type, rating, catalog_id: catId };
       const n = tb.terminals?.length ? tb.terminals.length : Math.max(0, Math.round(tb.count || 0));
       terminalsPerBlock[blockTag] = (terminalsPerBlock[blockTag] ?? 0) + n;
       const seen = blockTerminals.get(blockTag) ?? new Map<string, string[]>();
@@ -216,7 +221,7 @@ export function aggregate(pages: PageRecord[]): AggregateResult {
         seen.set(k, [...(seen.get(k) ?? []), sheetOf(p)]);
       }
       blockTerminals.set(blockTag, seen);
-      const key = ["TERMINAL", normRating(tb.rating), normQualifier(tb.terminal_type)].join("|");
+      const key = tb.catalog_id != null ? `TERMINAL|CAT|${tb.catalog_id}` : ["TERMINAL", normRating(tb.rating), normQualifier(tb.terminal_type)].join("|");
       const g = groups.get(key) ?? {
         key,
         deviceType: "TERMINAL",
@@ -236,6 +241,7 @@ export function aggregate(pages: PageRecord[]): AggregateResult {
         descriptionHint: `TERMINAL ${[tb.terminal_type, tb.rating].filter(Boolean).join(" ")}`.trim(),
         anomaly: false,
         notes: [],
+        catalogId: tb.catalog_id ?? null,
       };
       g.qty += n;
       if (!g.tags.includes(blockTag)) g.tags.push(blockTag);
